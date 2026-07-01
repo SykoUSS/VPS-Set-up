@@ -505,6 +505,19 @@ INSTALL_WEB_SERVER=true
 BLOCKING_ENABLED=true
 EOF
 
+    # Pre-configure Pi-hole web server port to 8443 BEFORE installation
+    # This prevents Pi-hole from grabbing port 80, which would conflict with NGINX
+    info "Pre-configuring Pi-hole web server port to ${PIHOLE_WEB_PORT}..."
+    if [[ -f /etc/pihole/pihole-FTL.conf ]]; then
+        if grep -q "^webserver.port=" /etc/pihole/pihole-FTL.conf; then
+            sed -i "s/^webserver.port=.*/webserver.port=${PIHOLE_WEB_PORT}/" /etc/pihole/pihole-FTL.conf
+        else
+            echo "webserver.port=${PIHOLE_WEB_PORT}" >> /etc/pihole/pihole-FTL.conf
+        fi
+    else
+        echo "webserver.port=${PIHOLE_WEB_PORT}" > /etc/pihole/pihole-FTL.conf
+    fi
+
     # Set environment variables for unattended install
     export PIHOLE_SKIP_OS_CHECK=true
 
@@ -518,8 +531,9 @@ EOF
     info "Setting Pi-hole admin password..."
     pihole -a -p "$PIHOLE_ADMIN_PASSWORD"
 
-    # Change web UI port to 8443 (to avoid conflict with NGINX on 80/443)
-    info "Configuring Pi-hole web UI to listen on port ${PIHOLE_WEB_PORT}..."
+    # Ensure Pi-hole web server port is set to 8443 (to avoid conflict with NGINX on 80/443)
+    # This was also set pre-install, but we verify and enforce it again here
+    info "Ensuring Pi-hole web UI is on port ${PIHOLE_WEB_PORT}..."
     if [[ -f /etc/pihole/pihole-FTL.conf ]]; then
         if grep -q "^webserver.port=" /etc/pihole/pihole-FTL.conf; then
             sed -i "s/^webserver.port=.*/webserver.port=${PIHOLE_WEB_PORT}/" /etc/pihole/pihole-FTL.conf
@@ -530,10 +544,34 @@ EOF
         echo "webserver.port=${PIHOLE_WEB_PORT}" > /etc/pihole/pihole-FTL.conf
     fi
 
-    # Restart Pi-hole to apply changes
+    # Restart Pi-hole to apply the port change
     info "Restarting Pi-hole..."
     pihole restartdns
     sleep 3
+
+    # Verify Pi-hole is NOT listening on port 80 (which would conflict with NGINX)
+    info "Checking that port 80 is free for NGINX..."
+    local port80_user
+    port80_user=$(ss -tlnp 2>/dev/null | grep ':80 ' | head -1 || true)
+    if [[ -n "$port80_user" ]]; then
+        warn "Port 80 is still in use by another process:"
+        warn "  $port80_user"
+        warn "Attempting to stop Pi-hole's web server temporarily..."
+        # Stop pihole-FTL web server component, then restart on correct port
+        pihole stop 2>/dev/null || true
+        sleep 2
+        pihole start 2>/dev/null || true
+        sleep 3
+        # Check again
+        port80_user=$(ss -tlnp 2>/dev/null | grep ':80 ' | head -1 || true)
+        if [[ -n "$port80_user" ]]; then
+            error "Port 80 is still occupied. NGINX will not be able to start."
+            error "Please stop the process using port 80 and re-run this script."
+            error "  Process: $port80_user"
+            return 1
+        fi
+    fi
+    success "Port 80 is free for NGINX."
 
     # Verify Pi-hole is running
     if pihole status 2>/dev/null | grep -q "running"; then
@@ -598,6 +636,29 @@ phase4_nginx_http() {
     # Install NGINX
     info "Installing NGINX..."
     apt install -y nginx
+
+    # Check if port 80 is already in use before starting NGINX
+    info "Checking if port 80 is available..."
+    local port80_user
+    port80_user=$(ss -tlnp 2>/dev/null | grep ':80 ' | head -1 || true)
+    if [[ -n "$port80_user" ]]; then
+        warn "Port 80 is in use by another process:"
+        warn "  $port80_user"
+        warn "Attempting to stop the conflicting service..."
+        # Try to stop common services that use port 80
+        systemctl stop lighttpd 2>/dev/null || true
+        pihole stop 2>/dev/null || true
+        sleep 2
+        # Re-check
+        port80_user=$(ss -tlnp 2>/dev/null | grep ':80 ' | head -1 || true)
+        if [[ -n "$port80_user" ]]; then
+            error "Port 80 is still in use. Cannot start NGINX."
+            error "Please stop the process using port 80 and re-run this script."
+            return 1
+        fi
+        success "Port 80 is now free."
+    fi
+
     systemctl enable --now nginx
     success "NGINX installed and running."
 
