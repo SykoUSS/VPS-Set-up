@@ -418,6 +418,18 @@ phase2_pihole() {
     # Configure Pi-hole web port to 8443
     configure_pihole_web_port "$PIHOLE_WEB_PORT"
 
+    # Set Pi-hole DNS listening mode to ALL — accept queries from all interfaces
+    # This is CRITICAL: Pi-hole v6 defaults to listeningMode=LOCAL which only accepts
+    # queries from localhost. Tailscale clients (and Tailscale MagicDNS) send queries
+    # from the tailscale0 interface, which LOCAL mode rejects. Without ALL, Pi-hole
+    # will not serve DNS to the tailnet and Tailscale DNS will silently fall back
+    # to the fallback DNS server (1.1.1.1), bypassing Pi-hole entirely.
+    info "Setting Pi-hole DNS listening mode to ALL (accept queries from Tailscale)..."
+    if command -v pihole-FTL &>/dev/null; then
+        pihole-FTL --config dns.listeningMode "ALL" 2>/dev/null || true
+        success "Pi-hole listening mode set to ALL."
+    fi
+
     # Set Pi-hole admin password
     info "Setting Pi-hole admin password..."
     PIHOLE_ADMIN_PASSWORD=$(ask_input "Enter Pi-hole admin password" "" "true")
@@ -581,33 +593,94 @@ EOF
         fi
     fi
 
-    # Switch Tailscale to use Pi-hole for DNS (Pi-hole is already running from Phase 2)
-    if command -v pihole &>/dev/null; then
-        info "Switching Tailscale to use Pi-hole for DNS..."
-        if [[ "$TS_EXIT_NODE" == true ]]; then
-            tailscale up --reset --accept-dns=true --advertise-exit-node --accept-risk=all --ssh 2>&1 || true
-        else
-            tailscale up --reset --accept-dns=true --accept-risk=all --ssh 2>&1 || true
+    # Configure VPS DNS to use Pi-hole directly (127.0.0.1)
+    # The VPS should NOT use Tailscale MagicDNS (100.100.100.100) for its own DNS
+    # because that creates a loop: Tailscale DNS → Pi-hole → Tailscale DNS → ...
+    # Instead, the VPS uses Pi-hole directly via localhost.
+    # Other tailnet devices use Tailscale DNS (configured in admin console) which
+    # forwards to this VPS's Pi-hole at the Tailscale IP.
+    info "Configuring VPS to use Pi-hole directly (127.0.0.1) for DNS..."
+    tailscale set --accept-dns=false 2>/dev/null || true
+
+    # Set resolv.conf to use Pi-hole locally
+    # Tailscale may have overwritten resolv.conf with MagicDNS — replace it
+    rm -f /etc/resolv.conf
+    echo "nameserver 127.0.0.1" > /etc/resolv.conf
+
+    # Verify DNS works through Pi-hole on the VPS
+    if curl -fsSL --connect-timeout 10 https://github.com >/dev/null 2>&1; then
+        success "VPS DNS set to Pi-hole (127.0.0.1). DNS resolution working."
+    else
+        warn "DNS resolution failed with local Pi-hole. Restoring fallback DNS..."
+        echo "nameserver ${DNS_UPSTREAM_1}" > /etc/resolv.conf
+        echo "nameserver ${DNS_UPSTREAM_2}" >> /etc/resolv.conf
+        warn "VPS using fallback DNS. Pi-hole DNS may not be ready yet."
+    fi
+
+    # Manual step: Configure Tailscale DNS in the admin console
+    # This MUST be done before Phase 4 (Certbot) because certbot needs DNS to
+    # resolve the domain names to verify them. If Tailscale DNS is not configured,
+    # DNS resolution will fail and certbot will fail to verify the domains.
+    echo ""
+    echo -e "${BOLD}${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${YELLOW}║         MANUAL STEP REQUIRED — TAILSCALE DNS                 ║${NC}"
+    echo -e "${BOLD}${YELLOW}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${BOLD}${YELLOW}║  Before continuing, you MUST configure Tailscale DNS:        ║${NC}"
+    echo -e "${BOLD}${YELLOW}║                                                             ║${NC}"
+    echo -e "${BOLD}${YELLOW}║  1. Go to: https://login.tailscale.com/admin/dns            ║${NC}"
+    echo -e "${BOLD}${YELLOW}║  2. Add DNS server: ${TS_IP} (this VPS — Pi-hole)        ${NC}"
+    echo -e "${BOLD}${YELLOW}║  3. Add fallback DNS: 1.1.1.1 (Cloudflare)                  ║${NC}"
+    echo -e "${BOLD}${YELLOW}║  4. Enable 'Override local DNS'                             ║${NC}"
+    echo -e "${BOLD}${YELLOW}║                                                             ║${NC}"
+    if [[ "$TS_EXIT_NODE" == true ]]; then
+        echo -e "${BOLD}${YELLOW}║  5. Approve exit node:                                      ║${NC}"
+        echo -e "${BOLD}${YELLOW}║     https://login.tailscale.com/admin/machines              ║${NC}"
+        echo -e "${BOLD}${YELLOW}║     Find this VPS → Edit route settings → Enable exit node   ║${NC}"
+        echo -e "${BOLD}${YELLOW}║                                                             ║${NC}"
+    fi
+    echo -e "${BOLD}${YELLOW}║  DNS will not work until this step is completed.            ║${NC}"
+    echo -e "${BOLD}${YELLOW}║  Certbot (Phase 4) will fail without working DNS.           ║${NC}"
+    echo -e "${BOLD}${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    if [[ "$TS_EXIT_NODE" == true ]]; then
+        echo -e "${BOLD}${YELLOW}Note about exit nodes:${NC}"
+        echo -e "  The VPS exit node routes all traffic from tailnet devices through the VPS."
+        echo -e "  Some websites (Reddit, Google, Netflix) block datacenter IP ranges and"
+        echo -e "  may refuse connections when accessed through the exit node."
+        echo -e "  Devices on trusted home networks may not need the exit node — use it"
+        echo -e "  only for devices on untrusted networks (public WiFi, traveling)."
+        echo ""
+    fi
+
+    # Wait for user to complete the manual step and verify
+    while true; do
+        if ! ask_yes_no "Have you completed the Tailscale DNS setup above?" "N"; then
+            warn "Tailscale DNS setup is required before continuing."
+            warn "Certbot will fail without working DNS."
+            if ! ask_yes_no "Skip this step and continue anyway? (Not recommended)" "N"; then
+                continue
+            fi
+            warn "Skipping Tailscale DNS verification. Certbot may fail."
+            break
         fi
 
-        # Verify DNS still works through Pi-hole
+        # Verify DNS resolution works
+        info "Verifying DNS resolution..."
         if curl -fsSL --connect-timeout 10 https://github.com >/dev/null 2>&1; then
-            success "Tailscale DNS switched to Pi-hole. DNS resolution working."
+            success "DNS resolution is working."
+            break
         else
-            warn "DNS resolution failed after switching to Pi-hole DNS."
-            warn "Restoring system DNS..."
-            cp /etc/resolv.conf.bak.vps-setup /etc/resolv.conf 2>/dev/null || true
-            if [[ "$TS_EXIT_NODE" == true ]]; then
-                tailscale up --reset --accept-dns=false --advertise-exit-node --accept-risk=all --ssh 2>&1 || true
-            else
-                tailscale up --reset --accept-dns=false --accept-risk=all --ssh 2>&1 || true
+            warn "DNS resolution is still not working. Please check:"
+            warn "  - The Tailscale DNS server is set to ${TS_IP}"
+            warn "  - 'Override local DNS' is enabled"
+            warn "  - Pi-hole is running (systemctl status pihole-FTL)"
+            warn "  - Try reconnecting your Tailscale devices"
+            if ! ask_yes_no "Retry DNS verification?" "Y"; then
+                warn "Skipping DNS verification. Certbot may fail."
+                break
             fi
-            warn "Tailscale DNS override disabled. Enable it later from the admin console."
         fi
-    else
-        warn "Pi-hole not found. Skipping Tailscale DNS switch."
-        warn "You can enable Pi-hole DNS later from the Tailscale admin console."
-    fi
+    done
 
     phase_completed "phase3"
 }
@@ -723,34 +796,59 @@ NGINXEOF
         return 1
     fi
 
+    # Verify DNS resolution works before attempting certbot
+    # (certbot needs to resolve the domain names to verify them)
+    info "Verifying DNS resolution before Certbot..."
+    local dns_ok=true
+    for domain in "$AMP_DOMAIN" "$PIHOLE_DOMAIN"; do
+        info "Checking DNS for ${domain}..."
+        local resolved_ip
+        resolved_ip=$(dig +short "$domain" 2>/dev/null | head -1)
+        if [[ -n "$resolved_ip" ]]; then
+            success "${domain} resolves to ${resolved_ip}"
+        else
+            warn "${domain} does not resolve yet."
+            dns_ok=false
+        fi
+    done
+
+    if [[ "$dns_ok" != true ]]; then
+        warn "DNS resolution is not working for one or more domains."
+        warn "Certbot will fail without working DNS."
+        warn "Please configure DNS records pointing to ${VPS_PUBLIC_IP:-this VPS} and try again."
+        if ! ask_yes_no "Attempt Certbot anyway?" "N"; then
+            warn "Skipping SSL. Run certbot manually after DNS is configured:"
+            warn "  certbot --nginx -d ${AMP_DOMAIN} -m ${LE_EMAIL}"
+            warn "  certbot --nginx -d ${PIHOLE_DOMAIN} -m ${LE_EMAIL}"
+            success "NGINX HTTP configuration complete (SSL skipped)."
+            phase_completed "phase4"
+            return 0
+        fi
+    fi
+
     # Obtain SSL certificates with Certbot
     info "Obtaining SSL certificates with Certbot..."
-    info "Make sure your DNS records for ${AMP_DOMAIN} and ${PIHOLE_DOMAIN} point to ${VPS_PUBLIC_IP:-this VPS}."
 
-    if ! ask_yes_no "Have you configured DNS records for both domains? Proceed with Certbot?" "Y"; then
-        warn "Skipping SSL. You can run certbot manually later:"
-        warn "  certbot --nginx -d ${AMP_DOMAIN} -m ${LE_EMAIL}"
-        warn "  certbot --nginx -d ${PIHOLE_DOMAIN} -m ${LE_EMAIL}"
+    # Get cert for AMP domain
+    info "Requesting certificate for ${AMP_DOMAIN}..."
+    if certbot --nginx -d "$AMP_DOMAIN" -m "$LE_EMAIL" --agree-tos --no-eff-email --redirect 2>&1; then
+        success "SSL certificate obtained for ${AMP_DOMAIN}"
     else
-        # Get cert for AMP domain
-        info "Requesting certificate for ${AMP_DOMAIN}..."
-        if certbot --nginx -d "$AMP_DOMAIN" -m "$LE_EMAIL" --agree-tos --no-eff-email --redirect 2>&1; then
-            success "SSL certificate obtained for ${AMP_DOMAIN}"
-        else
-            warn "Failed to obtain certificate for ${AMP_DOMAIN}. You can retry later."
-        fi
-
-        # Get cert for Pi-hole domain
-        info "Requesting certificate for ${PIHOLE_DOMAIN}..."
-        if certbot --nginx -d "$PIHOLE_DOMAIN" -m "$LE_EMAIL" --agree-tos --no-eff-email --redirect 2>&1; then
-            success "SSL certificate obtained for ${PIHOLE_DOMAIN}"
-        else
-            warn "Failed to obtain certificate for ${PIHOLE_DOMAIN}. You can retry later."
-        fi
-
-        # Reload NGINX to pick up SSL configs
-        systemctl reload nginx 2>/dev/null || true
+        warn "Failed to obtain certificate for ${AMP_DOMAIN}."
+        warn "You can retry later: certbot --nginx -d ${AMP_DOMAIN} -m ${LE_EMAIL}"
     fi
+
+    # Get cert for Pi-hole domain
+    info "Requesting certificate for ${PIHOLE_DOMAIN}..."
+    if certbot --nginx -d "$PIHOLE_DOMAIN" -m "$LE_EMAIL" --agree-tos --no-eff-email --redirect 2>&1; then
+        success "SSL certificate obtained for ${PIHOLE_DOMAIN}"
+    else
+        warn "Failed to obtain certificate for ${PIHOLE_DOMAIN}."
+        warn "You can retry later: certbot --nginx -d ${PIHOLE_DOMAIN} -m ${LE_EMAIL}"
+    fi
+
+    # Reload NGINX to pick up SSL configs
+    systemctl reload nginx 2>/dev/null || true
 
     success "NGINX HTTP + SSL configuration complete."
     phase_completed "phase4"
@@ -933,6 +1031,14 @@ phase6_ufw() {
     info "Resetting UFW firewall..."
     ufw --force reset
 
+    # Set default forward policy to ACCEPT if exit node is enabled
+    # UFW's default is DENY, which blocks forwarded traffic even with route rules.
+    # This is required for the Tailscale exit node to route internet traffic.
+    if [[ "$TS_EXIT_NODE" == true ]]; then
+        info "Setting UFW default forward policy to ACCEPT (required for exit node)..."
+        sed -i 's/^DEFAULT_FORWARD_POLICY="DENY"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw 2>/dev/null || true
+    fi
+
     # Default policies
     ufw default deny incoming
     ufw default allow outgoing
@@ -946,6 +1052,11 @@ phase6_ufw() {
 
     # Allow Pi-hole web UI (localhost only, but open for NGINX proxy)
     ufw allow "${PIHOLE_WEB_PORT}/tcp" comment "Pi-hole Web UI"
+
+    # Allow DNS (port 53) for Tailscale clients to query Pi-hole
+    # Without this, tailnet devices cannot reach Pi-hole for DNS resolution
+    ufw allow 53/tcp comment "Pi-hole DNS (TCP)"
+    ufw allow 53/udp comment "Pi-hole DNS (UDP)"
 
     # Allow Minecraft ports
     for instance in "${MC_INSTANCES[@]}"; do
@@ -1050,15 +1161,10 @@ phase7_verification() {
     echo ""
 
     # Manual steps
-    echo -e "${BOLD}${YELLOW}Manual steps required:${NC}"
-    echo ""
-    echo -e "${BOLD}1. Tailscale Admin Console:${NC}"
-    echo "   a. Go to: https://login.tailscale.com/admin/dns"
-    echo "   b. Add custom DNS server: ${TS_IP:-your VPS Tailscale IP}"
-    echo "   c. (Optional) Enable 'Override local DNS'"
+    echo -e "${BOLD}${YELLOW}Remaining manual steps:${NC}"
     echo ""
     if [[ "$TS_EXIT_NODE" == true ]]; then
-        echo -e "${BOLD}2. Approve Exit Node:${NC}"
+        echo -e "${BOLD}1. Approve Exit Node (if not already done):${NC}"
         echo "   a. Go to: https://login.tailscale.com/admin/machines"
         echo "   b. Find this VPS → Edit route settings → Enable 'Use as exit node'"
         echo ""
@@ -1068,7 +1174,7 @@ phase7_verification() {
     fi
 
     if [[ ${#MC_INSTANCES[@]} -gt 0 ]]; then
-        echo -e "${BOLD}3. Minecraft SRV Records:${NC}"
+        echo -e "${BOLD}2. Minecraft SRV Records:${NC}"
         echo "   Add these SRV records to your DNS registrar:"
         for instance in "${MC_INSTANCES[@]}"; do
             local name vps_port
