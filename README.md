@@ -246,7 +246,8 @@ sudo bash vps-setup.sh --uninstall --force
 
 | File | Purpose |
 |------|---------|
-| `/etc/pihole/pihole-FTL.conf` | Pi-hole webserver port config |
+| `/etc/pihole/pihole.toml` | Pi-hole v6+ TOML config (webserver port) |
+| `/etc/pihole/pihole-FTL.conf` | Pi-hole v5 legacy config (fallback) |
 | `/etc/pihole/setupVars.conf` | Pi-hole installer variables |
 | `/etc/nginx/sites-available/amp.conf` | AMP reverse proxy config |
 | `/etc/nginx/sites-available/pihole.conf` | Pi-hole reverse proxy config |
@@ -336,8 +337,8 @@ sudo ufw status | grep 25565
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Pi-hole deployment | Bare-metal | Per user preference; simpler than Docker |
-| Pi-hole version | v6+ compatible | Uses `pihole setpassword` and `systemctl restart pihole-FTL` |
-| Pi-hole web port | 8443 | Avoids conflict with NGINX on 80/443 |
+| Pi-hole version | v6+ compatible | Uses `pihole setpassword`, `pihole-FTL --config`, and TOML config (`pihole.toml`) |
+| Pi-hole web port | 8443 | Avoids conflict with NGINX on 80/443; configured via `webserver.port` in TOML |
 | AMP connection | HTTPS with `proxy_ssl_verify off` | AMP uses self-signed certs on Tailscale |
 | Minecraft proxy | NGINX `stream` module | TCP proxying for Java Edition |
 | MC routing | SRV records with subdomains | Clean player experience |

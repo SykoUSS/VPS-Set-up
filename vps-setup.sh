@@ -256,6 +256,57 @@ is_phase_completed() {
     [[ -f "${MARKER_DIR}/${phase}.done" ]]
 }
 
+# Configure Pi-hole web server port (handles both v5 and v6)
+# Pi-hole v6 uses TOML config (/etc/pihole/pihole.toml) and the CLI command
+# `pihole-FTL --config webserver.port "8443o,[::]:8443o"`
+# Pi-hole v5 uses /etc/pihole/pihole-FTL.conf with `webserver.port=8443`
+configure_pihole_web_port() {
+    local port="$1"
+    # Try v6+ CLI method first (works even before the config file exists)
+    if command -v pihole-FTL &>/dev/null; then
+        info "Setting Pi-hole web server port to ${port} (v6+ CLI method)..."
+        # The port format for v6 is "PORTo,[::]:PORTo" where 'o' = optional
+        # This makes FTL listen on both IPv4 and IPv6 on the specified port
+        if pihole-FTL --config webserver.port "${port}o,[::]:${port}o" 2>/dev/null; then
+            success "Pi-hole web server port set to ${port} via CLI (v6+)."
+            return 0
+        fi
+    fi
+
+    # Fallback: Try v6 TOML file method
+    if [[ -f /etc/pihole/pihole.toml ]]; then
+        info "Setting Pi-hole web server port to ${port} (v6 TOML method)..."
+        # Check if [webserver] section exists
+        if grep -q '^\[webserver\]' /etc/pihole/pihole.toml; then
+            # Update existing port line under [webserver]
+            if grep -q '^port\s*=' /etc/pihole/pihole.toml; then
+                sed -i "s/^port\s*=.*/port = \"${port}o,[::]:${port}o\"/" /etc/pihole/pihole.toml
+            else
+                # Add port line after [webserver] header
+                sed -i "/^\[webserver\]/a port = \"${port}o,[::]:${port}o\"" /etc/pihole/pihole.toml
+            fi
+        else
+            # Add [webserver] section with port
+            printf '\n[webserver]\nport = "%so,[::]:%so"\n' "$port" "$port" >> /etc/pihole/pihole.toml
+        fi
+        success "Pi-hole web server port set to ${port} via TOML config (v6)."
+        return 0
+    fi
+
+    # Fallback: v5 pihole-FTL.conf method
+    info "Setting Pi-hole web server port to ${port} (v5 legacy method)..."
+    if [[ -f /etc/pihole/pihole-FTL.conf ]]; then
+        if grep -q "^webserver.port=" /etc/pihole/pihole-FTL.conf; then
+            sed -i "s/^webserver.port=.*/webserver.port=${port}/" /etc/pihole/pihole-FTL.conf
+        else
+            echo "webserver.port=${port}" >> /etc/pihole/pihole-FTL.conf
+        fi
+    else
+        echo "webserver.port=${port}" > /etc/pihole/pihole-FTL.conf
+    fi
+    success "Pi-hole web server port set to ${port} via pihole-FTL.conf (v5 legacy)."
+}
+
 # ---------------------------------------------------------------------------
 # Phase 1: Prerequisites & System Update
 # ---------------------------------------------------------------------------
@@ -512,15 +563,7 @@ EOF
     # Pre-configure Pi-hole web server port to 8443 BEFORE installation
     # This prevents Pi-hole from grabbing port 80, which would conflict with NGINX
     info "Pre-configuring Pi-hole web server port to ${PIHOLE_WEB_PORT}..."
-    if [[ -f /etc/pihole/pihole-FTL.conf ]]; then
-        if grep -q "^webserver.port=" /etc/pihole/pihole-FTL.conf; then
-            sed -i "s/^webserver.port=.*/webserver.port=${PIHOLE_WEB_PORT}/" /etc/pihole/pihole-FTL.conf
-        else
-            echo "webserver.port=${PIHOLE_WEB_PORT}" >> /etc/pihole/pihole-FTL.conf
-        fi
-    else
-        echo "webserver.port=${PIHOLE_WEB_PORT}" > /etc/pihole/pihole-FTL.conf
-    fi
+    configure_pihole_web_port "${PIHOLE_WEB_PORT}"
 
     # Set environment variables for unattended install
     export PIHOLE_SKIP_OS_CHECK=true
@@ -544,15 +587,7 @@ EOF
     # Ensure Pi-hole web server port is set to 8443 (to avoid conflict with NGINX on 80/443)
     # This was also set pre-install, but we verify and enforce it again here
     info "Ensuring Pi-hole web UI is on port ${PIHOLE_WEB_PORT}..."
-    if [[ -f /etc/pihole/pihole-FTL.conf ]]; then
-        if grep -q "^webserver.port=" /etc/pihole/pihole-FTL.conf; then
-            sed -i "s/^webserver.port=.*/webserver.port=${PIHOLE_WEB_PORT}/" /etc/pihole/pihole-FTL.conf
-        else
-            echo "webserver.port=${PIHOLE_WEB_PORT}" >> /etc/pihole/pihole-FTL.conf
-        fi
-    else
-        echo "webserver.port=${PIHOLE_WEB_PORT}" > /etc/pihole/pihole-FTL.conf
-    fi
+    configure_pihole_web_port "${PIHOLE_WEB_PORT}"
 
     # Restart Pi-hole FTL service to apply the port change
     info "Restarting Pi-hole FTL service..."
