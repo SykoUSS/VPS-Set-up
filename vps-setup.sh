@@ -361,17 +361,29 @@ phase2_tailscale() {
     # Authenticate
     echo ""
     info "You need to authenticate this machine with your Tailscale account."
-    info "A browser window will open (or a URL will be shown) for authentication."
+    info "A URL will be shown below — open it in a browser to log in."
+    echo ""
     press_enter
+    info "Running 'tailscale up' — look for the login URL below:"
+    echo ""
     tailscale up --accept-risk=all 2>&1 || true
+    echo ""
+
     # Wait for connection
     info "Waiting for Tailscale connection..."
+    info "(If you haven't authenticated yet, open the URL shown above in your browser.)"
     local retries=0
-    while ! tailscale status 2>/dev/null | grep -q "100."; do
-        ((retries++))
-        if [[ $retries -ge 30 ]]; then
-            error "Tailscale did not connect within 30 seconds. Please check your authentication."
+    while ! tailscale status 2>/dev/null | grep -q "100\."; do
+        retries=$((retries + 1))
+        if [[ $retries -ge 60 ]]; then
+            error "Tailscale did not connect within 60 seconds."
+            error "Please authenticate using the URL above, then re-run this script."
+            error "You can also run 'tailscale up' manually and then re-run."
             return 1
+        fi
+        # Print a dot every 5 seconds to show progress
+        if (( retries % 5 == 0 )); then
+            info "Still waiting for Tailscale connection... ($retries/60)"
         fi
         sleep 1
     done
