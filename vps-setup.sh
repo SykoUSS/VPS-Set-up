@@ -872,11 +872,12 @@ phase5_nginx_stream() {
     # Verify NGINX has stream module
     info "Checking NGINX stream module..."
 
-    # Ensure AMP connection details are available
-    if [[ -z "$AMP_TS_IP" || -z "$AMP_TS_PORT" ]]; then
-        error "AMP server IP and port are required for Minecraft proxy configuration."
-        error "Please re-run Phase 1 or provide these values when prompted."
-        return 1
+    # Ensure AMP connection details are available (may be empty if Phase 1 was skipped)
+    if [[ -z "$AMP_TS_IP" ]]; then
+        AMP_TS_IP=$(ask_input "Enter AMP server Tailscale IP" "$DEFAULT_AMP_TS_IP")
+    fi
+    if [[ -z "$AMP_TS_PORT" ]]; then
+        AMP_TS_PORT=$(ask_input "Enter AMP server port" "$DEFAULT_AMP_TS_PORT")
     fi
 
     if ! nginx -V 2>&1 | grep -q "stream"; then
@@ -1022,16 +1023,18 @@ phase6_ssl() {
         LE_EMAIL_FLAG="--email $LE_EMAIL --agree-tos"
     fi
 
-    # Validate required variables before writing SSL configs
-    if [[ -z "$AMP_TS_IP" || -z "$AMP_TS_PORT" ]]; then
-        error "AMP server IP and port are required for SSL configuration."
-        error "Please re-run Phase 1 or provide these values when prompted."
-        return 1
+    # Ensure required variables are available (may be empty if earlier phases were skipped)
+    if [[ -z "$AMP_TS_IP" ]]; then
+        AMP_TS_IP=$(ask_input "Enter AMP server Tailscale IP" "$DEFAULT_AMP_TS_IP")
     fi
-    if [[ -z "$AMP_DOMAIN" || -z "$PIHOLE_DOMAIN" ]]; then
-        error "Domain names are required for SSL configuration."
-        error "Please re-run Phase 4 or provide these values when prompted."
-        return 1
+    if [[ -z "$AMP_TS_PORT" ]]; then
+        AMP_TS_PORT=$(ask_input "Enter AMP server port" "$DEFAULT_AMP_TS_PORT")
+    fi
+    if [[ -z "$AMP_DOMAIN" ]]; then
+        AMP_DOMAIN=$(ask_input "Enter domain name for AMP control panel" "amp.example.com")
+    fi
+    if [[ -z "$PIHOLE_DOMAIN" ]]; then
+        PIHOLE_DOMAIN=$(ask_input "Enter domain name for Pi-hole admin panel" "pihole.example.com")
     fi
 
     # Write full NGINX configs with SSL blocks (replacing HTTP-only configs from Phase 4)
