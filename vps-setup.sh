@@ -869,7 +869,7 @@ phase5_nginx_stream() {
         return 0
     fi
 
-    # Verify NGINX has stream module
+    # Verify NGINX has stream module available
     info "Checking NGINX stream module..."
 
     # Ensure AMP connection details are available (may be empty if Phase 1 was skipped)
@@ -880,14 +880,49 @@ phase5_nginx_stream() {
         AMP_TS_PORT=$(ask_input "Enter AMP server port" "$DEFAULT_AMP_TS_PORT")
     fi
 
-    if ! nginx -V 2>&1 | grep -q "stream"; then
-        error "NGINX does not have the stream module. Installing nginx-extras..."
-        apt install -y nginx-extras
-        if ! nginx -V 2>&1 | grep -q "stream"; then
+    # Check if the stream module is available (either built-in or as a dynamic module)
+    # On Ubuntu, the stream module is in libnginx-mod-stream and needs load_module
+    local stream_module_available=false
+    local stream_module_dynamic=false
+
+    # Check if stream is compiled in (static) — look for --with-stream without =dynamic
+    if nginx -V 2>&1 | grep -q -- "--with-stream\b"; then
+        stream_module_available=true
+        info "NGINX stream module is compiled in (static)."
+    # Check if stream is available as a dynamic module
+    elif [[ -f /usr/lib/nginx/modules/ngx_stream_module.so ]] || dpkg -l libnginx-mod-stream &>/dev/null; then
+        stream_module_available=true
+        stream_module_dynamic=true
+        info "NGINX stream module is available as a dynamic module."
+    else
+        # Try installing the stream module package
+        info "NGINX stream module not found. Installing libnginx-mod-stream..."
+        apt install -y libnginx-mod-stream 2>/dev/null || apt install -y nginx-extras 2>/dev/null || true
+
+        # Re-check after installation
+        if nginx -V 2>&1 | grep -q -- "--with-stream\b"; then
+            stream_module_available=true
+            info "NGINX stream module is now available (static)."
+        elif [[ -f /usr/lib/nginx/modules/ngx_stream_module.so ]] || dpkg -l libnginx-mod-stream &>/dev/null; then
+            stream_module_available=true
+            stream_module_dynamic=true
+            info "NGINX stream module is now available (dynamic)."
+        else
             error "Could not enable NGINX stream module. Cannot proxy Minecraft."
+            error "Try: apt install libnginx-mod-stream"
             return 1
         fi
     fi
+
+    # If stream module is dynamic, ensure load_module directive is in nginx.conf
+    if [[ "$stream_module_dynamic" == true ]]; then
+        if ! grep -q "ngx_stream_module" /etc/nginx/nginx.conf; then
+            info "Adding stream module load directive to nginx.conf..."
+            # load_module must be in the main context, before events block
+            sed -i '1s/^/load_module \/usr\/lib\/nginx\/modules\/ngx_stream_module.so;\n/' /etc/nginx/nginx.conf
+        fi
+    fi
+
     success "NGINX stream module is available."
 
     # Ask how many Minecraft instances
@@ -1741,6 +1776,12 @@ uninstall_all() {
                 # Clean up any blank lines left behind
                 sed -i '/^$/N;/^\n$/d' /etc/nginx/nginx.conf
                 success "Stream block removed from nginx.conf."
+            fi
+            # Also remove the load_module directive for the stream module if we added it
+            if grep -q "ngx_stream_module" /etc/nginx/nginx.conf; then
+                info "Removing stream module load directive from nginx.conf..."
+                sed -i '/ngx_stream_module/d' /etc/nginx/nginx.conf
+                success "Stream module load directive removed."
             fi
         fi
 
