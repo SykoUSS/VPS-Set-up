@@ -180,6 +180,9 @@ Point your domain names to the VPS public IP:
 3. Click the three-dot menu → "Edit route settings"
 4. Enable "Use as exit node"
 
+> **Note:** The script automatically configures IP forwarding and NAT masquerading
+> (required since Tailscale v1.70+). No additional network configuration is needed on the VPS.
+
 ## Idempotency
 
 The script is **idempotent** — safe to re-run. Completed phases are tracked via marker files in `/etc/vps-setup/`:

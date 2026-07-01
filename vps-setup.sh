@@ -480,6 +480,57 @@ phase2_tailscale() {
         TS_EXIT_NODE=true
         info "Configuring as exit node..."
         tailscale up --reset --advertise-exit-node --accept-risk=all --accept-dns=false --ssh
+
+        # Enable IP forwarding (required for exit node to route traffic)
+        # Since Tailscale v1.70+, automatic iptables/nftables rules were removed;
+        # IP forwarding and NAT masquerading must be configured manually.
+        info "Enabling IP forwarding for exit node..."
+        sysctl -w net.ipv4.ip_forward=1 >/dev/null
+        sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
+        # Persist across reboots
+        if ! grep -q "^net.ipv4.ip_forward" /etc/sysctl.d/99-tailscale.conf 2>/dev/null; then
+            cat > /etc/sysctl.d/99-tailscale.conf << EOF
+# Tailscale exit node — IP forwarding
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+EOF
+            sysctl --system >/dev/null 2>&1 || true
+        fi
+        success "IP forwarding enabled."
+
+        # Enable NAT masquerading (required for exit node since Tailscale v1.70+)
+        # This translates tailnet client IPs to the VPS's public IP for internet traffic
+        info "Configuring NAT masquerading for exit node..."
+        if command -v nft &>/dev/null; then
+            # Use nftables (preferred on modern Ubuntu)
+            nft add table ip tailscale 2>/dev/null || true
+            nft add chain ip tailscale postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true
+            nft add rule ip tailscale postrouting oifname != "tailscale0" masquerade 2>/dev/null || true
+            # Persist nftables rules
+            mkdir -p /etc/nftables.d
+            nft list ruleset > /etc/nftables.d/50-tailscale-exit-node.nft 2>/dev/null || true
+            success "NAT masquerading configured (nftables)."
+        elif command -v iptables &>/dev/null; then
+            # Fallback to iptables
+            iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null || true
+            # Try common interface names if eth0 doesn't exist
+            for iface in ens3 ens5 enp1s0 wlan0; do
+                iptables -t nat -A POSTROUTING -o "$iface" -j MASQUERADE 2>/dev/null || true
+            done
+            # Persist iptables rules
+            if command -v netfilter-persistent &>/dev/null; then
+                netfilter-persistent save 2>/dev/null || true
+            elif command -v iptables-save &>/dev/null; then
+                mkdir -p /etc/iptables
+                iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+            fi
+            success "NAT masquerading configured (iptables)."
+        else
+            warn "Neither nftables nor iptables found. NAT masquerading not configured."
+            warn "Exit node may not route internet traffic correctly."
+            warn "Install nftables: apt install nftables"
+        fi
+
         success "Exit node advertised. You will need to approve it in the Tailscale admin console."
     fi
 
@@ -489,11 +540,17 @@ phase2_tailscale() {
 
     # Verify connectivity to AMP
     info "Verifying connectivity to AMP server at ${AMP_TS_IP}..."
-    if curl -sk --connect-timeout 5 "https://${AMP_TS_IP}:${AMP_TS_PORT}" >/dev/null 2>&1; then
+    local amp_error
+    amp_error=$(curl -sk --connect-timeout 5 --write-out "%{http_code}" --output /dev/null "https://${AMP_TS_IP}:${AMP_TS_PORT}" 2>&1) || true
+    if [[ "$amp_error" =~ ^[0-9]+$ ]] && [[ "$amp_error" -ge 200 ]] 2>/dev/null; then
         success "Successfully connected to AMP at ${AMP_TS_IP}:${AMP_TS_PORT}"
     else
         warn "Could not connect to AMP at ${AMP_TS_IP}:${AMP_TS_PORT}."
-        warn "Make sure the AMP server is running and accessible on the Tailscale network."
+        warn "Troubleshooting:"
+        warn "  1. Check that AMP is running on the remote machine"
+        warn "  2. Verify the Tailscale IP is correct: run 'tailscale status' on both machines"
+        warn "  3. Verify the AMP port is correct (default: 443 for HTTPS, 8080 for HTTP)"
+        warn "  4. Test from this VPS: curl -sk https://${AMP_TS_IP}:${AMP_TS_PORT}"
         if ! ask_yes_no "Continue anyway?" "Y"; then
             error "Aborting. Please verify AMP connectivity and re-run."
             return 1
@@ -1348,6 +1405,9 @@ phase8_tailscale_dns() {
         echo "   c. Click the three-dot menu → 'Edit route settings'."
         echo "   d. Enable the 'Use as exit node' option."
         echo ""
+        echo -e "   ${GREEN}IP forwarding and NAT masquerading have been configured automatically.${NC}"
+        echo "   No additional network configuration is needed on this VPS."
+        echo ""
     else
         echo "   (Exit node was not configured — skip this step.)"
         echo ""
@@ -1909,6 +1969,31 @@ uninstall_all() {
         rm -f /usr/share/keyrings/tailscale-archive-keyring.gpg 2>/dev/null || true
         rm -f /etc/apt/sources.list.d/tailscale.list 2>/dev/null || true
         success "Tailscale repository files removed."
+
+        # Remove exit node configuration (IP forwarding + NAT masquerading)
+        info "Removing exit node network configuration..."
+        # Remove IP forwarding config
+        rm -f /etc/sysctl.d/99-tailscale.conf 2>/dev/null || true
+        sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
+        sysctl -w net.ipv6.conf.all.forwarding=0 >/dev/null 2>&1 || true
+        # Remove nftables masquerade rules
+        if command -v nft &>/dev/null; then
+            nft delete table ip tailscale 2>/dev/null || true
+            rm -f /etc/nftables.d/50-tailscale-exit-node.nft 2>/dev/null || true
+        fi
+        # Remove iptables masquerade rules
+        if command -v iptables &>/dev/null; then
+            iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null || true
+            for iface in ens3 ens5 enp1s0 wlan0; do
+                iptables -t nat -D POSTROUTING -o "$iface" -j MASQUERADE 2>/dev/null || true
+            done
+            if command -v netfilter-persistent &>/dev/null; then
+                netfilter-persistent save 2>/dev/null || true
+            elif command -v iptables-save &>/dev/null; then
+                iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+            fi
+        fi
+        success "Exit node network configuration removed."
     else
         info "Skipping Tailscale removal."
     fi
