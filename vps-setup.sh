@@ -210,6 +210,38 @@ check_os() {
     info "Detected Ubuntu $VERSION_ID"
 }
 
+ensure_dns() {
+    # Check if DNS resolution works, and fix it if not
+    info "Checking DNS resolution..."
+    if curl -fsSL --connect-timeout 10 https://pkgs.tailscale.com >/dev/null 2>&1; then
+        success "DNS resolution is working."
+        return 0
+    fi
+
+    warn "DNS resolution failed. Attempting to fix with fallback DNS servers..."
+    # Backup existing resolv.conf
+    cp /etc/resolv.conf /etc/resolv.conf.bak.vps-setup 2>/dev/null || true
+
+    # Add fallback DNS servers (Cloudflare and Google) if not already present
+    if ! grep -q "nameserver 1.1.1.1" /etc/resolv.conf 2>/dev/null; then
+        {
+            echo "# Fallback DNS added by vps-setup.sh"
+            echo "nameserver 1.1.1.1"
+            echo "nameserver 8.8.8.8"
+        } >> /etc/resolv.conf
+    fi
+
+    # Test again
+    if curl -fsSL --connect-timeout 10 https://pkgs.tailscale.com >/dev/null 2>&1; then
+        success "DNS resolution fixed with fallback servers."
+        return 0
+    fi
+
+    error "Cannot resolve hostnames even with fallback DNS."
+    error "Please check your VPS network configuration and try again."
+    return 1
+}
+
 phase_completed() {
     local phase="$1"
     mkdir -p "$MARKER_DIR"
@@ -253,6 +285,9 @@ phase1_prerequisites() {
     # Ask for AMP server details
     AMP_TS_IP=$(ask_input "Enter AMP server Tailscale IP" "$DEFAULT_AMP_TS_IP")
     AMP_TS_PORT=$(ask_input "Enter AMP server port" "$DEFAULT_AMP_TS_PORT")
+
+    # Ensure DNS works before downloading anything
+    ensure_dns || return 1
 
     # Update system
     info "Updating system packages... (this may take a few minutes)"
@@ -298,16 +333,24 @@ phase2_tailscale() {
         return 0
     fi
 
-    # Add Tailscale GPG key and repository
-    info "Adding Tailscale repository..."
-    curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-    curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | tee /etc/apt/sources.list.d/tailscale.list >/dev/null
+    # Ensure DNS resolution works before attempting downloads
+    ensure_dns || return 1
 
-    # Install Tailscale
-    info "Installing Tailscale..."
-    apt update -y
-    apt install -y tailscale
-    success "Tailscale installed."
+    # Check if Tailscale is already installed
+    if command -v tailscale &>/dev/null; then
+        info "Tailscale is already installed. Skipping installation."
+    else
+        # Add Tailscale GPG key and repository
+        info "Adding Tailscale repository..."
+        curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+        curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | tee /etc/apt/sources.list.d/tailscale.list >/dev/null
+
+        # Install Tailscale
+        info "Installing Tailscale..."
+        apt update -y
+        apt install -y tailscale
+        success "Tailscale installed."
+    fi
 
     # Enable and start tailscaled
     info "Enabling and starting tailscaled..."
