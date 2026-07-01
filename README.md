@@ -67,6 +67,12 @@ sudo bash vps-setup.sh --add-mc
 # Remove a Minecraft instance
 sudo bash vps-setup.sh --remove-mc
 
+# Remove everything installed by this script
+sudo bash vps-setup.sh --uninstall
+
+# Remove everything without confirmation prompts
+sudo bash vps-setup.sh --uninstall --force
+
 # Show current setup status
 sudo bash vps-setup.sh --status
 
@@ -196,6 +202,46 @@ sudo rm /etc/vps-setup/phase6.done
 sudo bash vps-setup.sh
 ```
 
+## Uninstalling
+
+The `--uninstall` flag removes everything the setup script installed. It reverses all 9 phases in reverse order:
+
+```bash
+# Interactive uninstall (confirms each step)
+sudo bash vps-setup.sh --uninstall
+
+# Uninstall without confirmation prompts
+sudo bash vps-setup.sh --uninstall --force
+```
+
+### What gets removed
+
+| Step | What's removed |
+|------|---------------|
+| 1 | SSL certificates & certbot (`/etc/letsencrypt/`, certbot package) |
+| 2 | Minecraft proxy configs (`/etc/nginx/streams-*`) & UFW rules |
+| 3 | NGINX site configs & NGINX package |
+| 4 | Pi-hole (service, packages, `/etc/pihole/`, `/var/log/pihole/`) |
+| 5 | Tailscale (service, package, repo files, GPG key) |
+| 6 | UFW firewall rules (reset to SSH-only) |
+| 7 | Prerequisite packages (curl, wget, etc. — common ones are kept) |
+| 8 | System changes (resolv.conf restored, hostname optionally restored, markers & logs deleted) |
+
+### What's NOT removed
+
+- **DNS records** — You must manually remove A records, SRV records, etc. from your domain
+- **Tailscale admin console** — Remove the machine from [Tailscale Admin Console](https://login.tailscale.com/admin/machines)
+- **Tailscale exit node approval** — Revoke in the admin console
+- **`/etc/hosts` entries** — Review and remove any entries added by the script
+- **Common packages** — `ufw`, `ca-certificates`, `gnupg`, `lsb-release`, `curl`, `wget` are kept
+
+### After uninstalling
+
+1. Verify `/etc/resolv.conf` has valid nameservers (the script restores from backup or sets `1.1.1.1`/`8.8.8.8`)
+2. Remove DNS records pointing to this VPS
+3. Remove the machine from the Tailscale admin console
+4. Review `/etc/hosts` for stale entries
+
 ## Files Modified on Target VPS
 
 | File | Purpose |
@@ -209,7 +255,7 @@ sudo bash vps-setup.sh
 | `/etc/nginx/sites-enabled/` | Symlinks to HTTP configs |
 | `/etc/nginx/streams-enabled/` | Symlinks to stream configs |
 | `/etc/letsencrypt/` | SSL certificates (managed by certbot) |
-| `/etc/vps-setup/` | Phase completion markers |
+| `/etc/vps-setup/` | Phase completion markers & original hostname backup |
 | `/var/log/vps-setup.log` | Setup script log |
 
 ## Troubleshooting
@@ -233,7 +279,10 @@ pihole status
 # Check if port 8443 is listening
 sudo ss -tlnp | grep 8443
 
-# Restart Pi-hole
+# Restart Pi-hole FTL service (v6+)
+sudo systemctl restart pihole-FTL
+
+# Legacy restart (v5)
 pihole restartdns
 ```
 
@@ -243,8 +292,11 @@ pihole restartdns
 # Check status
 tailscale status
 
-# Re-authenticate
-sudo tailscale up --accept-risk=all
+# Re-authenticate (use --reset to avoid flag accumulation errors)
+sudo tailscale up --reset --accept-risk=all
+
+# If you get "changing settings requires mentioning all non-default flags", use --reset:
+sudo tailscale up --reset --accept-risk=all --accept-dns=false --ssh
 
 # Check logs
 sudo journalctl -u tailscaled -f
@@ -284,6 +336,7 @@ sudo ufw status | grep 25565
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Pi-hole deployment | Bare-metal | Per user preference; simpler than Docker |
+| Pi-hole version | v6+ compatible | Uses `pihole setpassword` and `systemctl restart pihole-FTL` |
 | Pi-hole web port | 8443 | Avoids conflict with NGINX on 80/443 |
 | AMP connection | HTTPS with `proxy_ssl_verify off` | AMP uses self-signed certs on Tailscale |
 | Minecraft proxy | NGINX `stream` module | TCP proxying for Java Edition |

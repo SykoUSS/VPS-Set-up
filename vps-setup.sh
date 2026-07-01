@@ -19,9 +19,11 @@
 #                       └── ...
 #
 # Usage:
-#   sudo bash vps-setup.sh          # Run full interactive setup
-#   sudo bash vps-setup.sh --help   # Show help
-#   sudo bash vps-setup.sh --add-mc # Add a new Minecraft instance
+#   sudo bash vps-setup.sh              # Run full interactive setup
+#   sudo bash vps-setup.sh --help       # Show help
+#   sudo bash vps-setup.sh --add-mc     # Add a new Minecraft instance
+#   sudo bash vps-setup.sh --remove-mc  # Remove a Minecraft instance
+#   sudo bash vps-setup.sh --uninstall  # Remove everything installed by this script
 #
 # Idempotent: Safe to re-run. Completed phases are skipped unless --force is used.
 # =============================================================================
@@ -269,6 +271,8 @@ phase1_prerequisites() {
     # Set hostname
     VPS_HOSTNAME=$(ask_input "Enter VPS hostname" "$(hostname)")
     if [[ "$VPS_HOSTNAME" != "$(hostname)" ]]; then
+        # Save original hostname for potential uninstall
+        echo "$(hostname)" > "${MARKER_DIR}/original-hostname"
         info "Setting hostname to $VPS_HOSTNAME..."
         hostnamectl set-hostname "$VPS_HOSTNAME"
         # Also update /etc/hosts
@@ -374,7 +378,7 @@ phase2_tailscale() {
     info "Running 'tailscale up' — look for the login URL below:"
     info "(Using --accept-dns=false to preserve system DNS during setup)"
     echo ""
-    tailscale up --accept-risk=all --accept-dns=false 2>&1 || true
+    tailscale up --accept-risk=all --accept-dns=false --ssh 2>&1 || true
     echo ""
 
     # Wait for connection
@@ -424,7 +428,7 @@ phase2_tailscale() {
     if ask_yes_no "Should this VPS advertise as a Tailscale exit node?" "Y"; then
         TS_EXIT_NODE=true
         info "Configuring as exit node..."
-        tailscale up --advertise-exit-node --accept-risk=all --accept-dns=false
+        tailscale up --reset --advertise-exit-node --accept-risk=all --accept-dns=false --ssh
         success "Exit node advertised. You will need to approve it in the Tailscale admin console."
     fi
 
@@ -529,7 +533,13 @@ EOF
 
     # Post-install: Set admin password
     info "Setting Pi-hole admin password..."
-    pihole -a -p "$PIHOLE_ADMIN_PASSWORD"
+    # Pi-hole v6+ uses 'pihole setpassword', older versions use 'pihole -a -p'
+    if pihole setpassword "$PIHOLE_ADMIN_PASSWORD" 2>/dev/null; then
+        success "Pi-hole admin password set (v6+ method)."
+    else
+        info "Trying legacy password method..."
+        pihole -a -p "$PIHOLE_ADMIN_PASSWORD" 2>/dev/null || true
+    fi
 
     # Ensure Pi-hole web server port is set to 8443 (to avoid conflict with NGINX on 80/443)
     # This was also set pre-install, but we verify and enforce it again here
@@ -544,9 +554,9 @@ EOF
         echo "webserver.port=${PIHOLE_WEB_PORT}" > /etc/pihole/pihole-FTL.conf
     fi
 
-    # Restart Pi-hole to apply the port change
-    info "Restarting Pi-hole..."
-    pihole restartdns
+    # Restart Pi-hole FTL service to apply the port change
+    info "Restarting Pi-hole FTL service..."
+    systemctl restart pihole-FTL 2>/dev/null || pihole restartdns 2>/dev/null || true
     sleep 3
 
     # Verify Pi-hole is NOT listening on port 80 (which would conflict with NGINX)
@@ -556,28 +566,48 @@ EOF
     if [[ -n "$port80_user" ]]; then
         warn "Port 80 is still in use by another process:"
         warn "  $port80_user"
-        warn "Attempting to stop Pi-hole's web server temporarily..."
-        # Stop pihole-FTL web server component, then restart on correct port
-        pihole stop 2>/dev/null || true
+        warn "Attempting to restart Pi-hole FTL to release port 80..."
+        systemctl stop pihole-FTL 2>/dev/null || true
         sleep 2
-        pihole start 2>/dev/null || true
+        systemctl start pihole-FTL 2>/dev/null || true
         sleep 3
         # Check again
         port80_user=$(ss -tlnp 2>/dev/null | grep ':80 ' | head -1 || true)
         if [[ -n "$port80_user" ]]; then
-            error "Port 80 is still occupied. NGINX will not be able to start."
-            error "Please stop the process using port 80 and re-run this script."
-            error "  Process: $port80_user"
-            return 1
+            # Last resort: kill whatever is on port 80 if it's pihole-FTL
+            local pid_on_80
+            pid_on_80=$(ss -tlnp 2>/dev/null | grep ':80 ' | grep -oP 'pid=\K[0-9]+' | head -1 || true)
+            if [[ -n "$pid_on_80" ]]; then
+                local proc_name
+                proc_name=$(ps -p "$pid_on_80" -o comm= 2>/dev/null || echo "unknown")
+                if [[ "$proc_name" == "pihole-FTL" ]]; then
+                    warn "Killing pihole-FTL on port 80 and restarting on port ${PIHOLE_WEB_PORT}..."
+                    kill "$pid_on_80" 2>/dev/null || true
+                    sleep 2
+                    systemctl start pihole-FTL 2>/dev/null || true
+                    sleep 3
+                fi
+            fi
+            # Final check
+            port80_user=$(ss -tlnp 2>/dev/null | grep ':80 ' | head -1 || true)
+            if [[ -n "$port80_user" ]]; then
+                error "Port 80 is still occupied. NGINX will not be able to start."
+                error "Please stop the process using port 80 and re-run this script."
+                error "  Process: $port80_user"
+                return 1
+            fi
         fi
     fi
     success "Port 80 is free for NGINX."
 
     # Verify Pi-hole is running
-    if pihole status 2>/dev/null | grep -q "running"; then
-        success "Pi-hole is running on port ${PIHOLE_WEB_PORT}."
+    if systemctl is-active --quiet pihole-FTL 2>/dev/null; then
+        success "Pi-hole FTL is running."
+    elif pihole status 2>/dev/null | grep -qi "running"; then
+        success "Pi-hole is running."
     else
         warn "Pi-hole may not be fully running. Check with: pihole status"
+        warn "You can try: systemctl restart pihole-FTL"
     fi
 
     # Configure Pi-hole to listen on all interfaces (needed for Tailscale DNS)
@@ -592,10 +622,12 @@ EOF
     # (During setup we used --accept-dns=false to preserve system DNS)
     if command -v tailscale &>/dev/null && tailscale status &>/dev/null; then
         info "Switching Tailscale to use Pi-hole for DNS..."
+        # Use --reset to avoid needing to specify all current non-default flags
+        # (tailscale up requires mentioning all non-default flags unless --reset is used)
         if [[ "$TS_EXIT_NODE" == true ]]; then
-            tailscale up --accept-dns=true --advertise-exit-node --accept-risk=all 2>&1 || true
+            tailscale up --reset --accept-dns=true --advertise-exit-node --accept-risk=all --ssh 2>&1 || true
         else
-            tailscale up --accept-dns=true --accept-risk=all 2>&1 || true
+            tailscale up --reset --accept-dns=true --accept-risk=all --ssh 2>&1 || true
         fi
         # Verify DNS still works after switching to Pi-hole
         if curl -fsSL --connect-timeout 10 https://github.com >/dev/null 2>&1; then
@@ -606,9 +638,9 @@ EOF
             # Restore system DNS
             cp /etc/resolv.conf.bak.pre-tailscale /etc/resolv.conf 2>/dev/null || true
             if [[ "$TS_EXIT_NODE" == true ]]; then
-                tailscale up --accept-dns=false --advertise-exit-node --accept-risk=all 2>&1 || true
+                tailscale up --reset --accept-dns=false --advertise-exit-node --accept-risk=all --ssh 2>&1 || true
             else
-                tailscale up --accept-dns=false --accept-risk=all 2>&1 || true
+                tailscale up --reset --accept-dns=false --accept-risk=all --ssh 2>&1 || true
             fi
             warn "Tailscale DNS override disabled. You can enable it later from the Tailscale admin console."
         fi
@@ -642,21 +674,26 @@ phase4_nginx_http() {
     local port80_user
     port80_user=$(ss -tlnp 2>/dev/null | grep ':80 ' | head -1 || true)
     if [[ -n "$port80_user" ]]; then
-        warn "Port 80 is in use by another process:"
-        warn "  $port80_user"
-        warn "Attempting to stop the conflicting service..."
-        # Try to stop common services that use port 80
-        systemctl stop lighttpd 2>/dev/null || true
-        pihole stop 2>/dev/null || true
-        sleep 2
-        # Re-check
-        port80_user=$(ss -tlnp 2>/dev/null | grep ':80 ' | head -1 || true)
-        if [[ -n "$port80_user" ]]; then
-            error "Port 80 is still in use. Cannot start NGINX."
-            error "Please stop the process using port 80 and re-run this script."
-            return 1
+        # Check if NGINX itself is already on port 80 (from a previous run)
+        if echo "$port80_user" | grep -q "nginx"; then
+            info "NGINX is already running on port 80 (likely from a previous run). Will reload it."
+        else
+            warn "Port 80 is in use by another process:"
+            warn "  $port80_user"
+            warn "Attempting to stop the conflicting service..."
+            # Try to stop common services that use port 80
+            systemctl stop lighttpd 2>/dev/null || true
+            systemctl stop pihole-FTL 2>/dev/null || true
+            sleep 2
+            # Re-check
+            port80_user=$(ss -tlnp 2>/dev/null | grep ':80 ' | head -1 || true)
+            if [[ -n "$port80_user" ]]; then
+                error "Port 80 is still in use. Cannot start NGINX."
+                error "Please stop the process using port 80 and re-run this script."
+                return 1
+            fi
+            success "Port 80 is now free."
         fi
-        success "Port 80 is now free."
     fi
 
     systemctl enable --now nginx
@@ -1354,7 +1391,7 @@ phase9_verification() {
     echo ""
     echo -e "${BOLD}Useful Commands:${NC}"
     echo "  pihole status          — Check Pi-hole status"
-    echo "  pihole -a -p <pass>    — Change Pi-hole admin password"
+    echo "  pihole setpassword <pass> — Change Pi-hole admin password (v6+)"
     echo "  tailscale status       — Check Tailscale connection"
     echo "  nginx -t               — Test NGINX configuration"
     echo "  systemctl reload nginx — Reload NGINX after config changes"
@@ -1503,6 +1540,399 @@ remove_minecraft_instance() {
 }
 
 # ---------------------------------------------------------------------------
+# Uninstall — Remove everything installed by this script
+# ---------------------------------------------------------------------------
+
+uninstall_all() {
+    echo ""
+    echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}${BOLD}║                    ⚠  UNINSTALL MODE  ⚠                     ║${NC}"
+    echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${RED}This will remove EVERYTHING installed by this script:${NC}"
+    echo "  • SSL certificates (Let's Encrypt / certbot)"
+    echo "  • NGINX reverse proxy configs and the NGINX package"
+    echo "  • Minecraft TCP proxy configs"
+    echo "  • Pi-hole DNS sinkhole"
+    echo "  • Tailscale VPN"
+    echo "  • UFW firewall rules (reset to SSH-only)"
+    echo "  • Prerequisite packages installed by this script"
+    echo "  • All marker files and logs"
+    echo ""
+    echo -e "${YELLOW}This action is destructive and cannot be easily undone.${NC}"
+    echo ""
+
+    if [[ "$FORCE" != true ]]; then
+        if ! ask_yes_no "Are you sure you want to uninstall everything?" "N"; then
+            info "Uninstall cancelled."
+            exit 0
+        fi
+    fi
+
+    log "=== UNINSTALL STARTED ==="
+
+    # ------------------------------------------------------------------
+    # Step 1: Remove SSL certificates & certbot (reverse of Phase 6)
+    # ------------------------------------------------------------------
+    echo ""
+    separator
+    echo -e "${BOLD}${RED}Step 1/8: Removing SSL certificates & certbot${NC}"
+    separator
+    echo ""
+
+    if [[ "$FORCE" == true ]] || ask_yes_no "Remove SSL certificates and certbot?" "Y"; then
+        # Remove certbot renewal hook
+        if [[ -f /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh ]]; then
+            info "Removing certbot renewal hook..."
+            rm -f /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+            success "Certbot renewal hook removed."
+        else
+            info "No certbot renewal hook found."
+        fi
+
+        # Remove SSL certificates
+        if [[ -d /etc/letsencrypt/live ]]; then
+            info "Removing Let's Encrypt certificates..."
+            # Get list of certificate names
+            local cert_names
+            cert_names=$(certbot certificates 2>/dev/null | grep "Certificate Name:" | awk '{print $3}' || true)
+            if [[ -n "$cert_names" ]]; then
+                echo "$cert_names" | while read -r cert_name; do
+                    if [[ -n "$cert_name" ]]; then
+                        info "Deleting certificate: $cert_name"
+                        certbot delete --cert-name "$cert_name" --non-interactive 2>/dev/null || true
+                    fi
+                done
+            else
+                # Fallback: remove the directories directly
+                rm -rf /etc/letsencrypt/live /etc/letsencrypt/archive /etc/letsencrypt/renewal 2>/dev/null || true
+            fi
+            success "SSL certificates removed."
+        else
+            info "No Let's Encrypt certificates found."
+        fi
+
+        # Disable certbot timer
+        info "Disabling certbot renewal timer..."
+        systemctl disable --now certbot.timer 2>/dev/null || true
+
+        # Uninstall certbot
+        if command -v certbot &>/dev/null || dpkg -l certbot &>/dev/null 2>&1; then
+            info "Uninstalling certbot..."
+            apt purge -y certbot python3-certbot-nginx 2>/dev/null || true
+            apt autoremove -y 2>/dev/null || true
+            success "Certbot uninstalled."
+        else
+            info "Certbot is not installed."
+        fi
+    else
+        info "Skipping SSL/certbot removal."
+    fi
+
+    # ------------------------------------------------------------------
+    # Step 2: Remove NGINX stream configs & Minecraft proxy (reverse of Phase 5)
+    # ------------------------------------------------------------------
+    echo ""
+    separator
+    echo -e "${BOLD}${RED}Step 2/8: Removing Minecraft proxy & NGINX stream configs${NC}"
+    separator
+    echo ""
+
+    if [[ "$FORCE" == true ]] || ask_yes_no "Remove Minecraft proxy configs?" "Y"; then
+        # Parse Minecraft ports from config for UFW rule removal
+        local mc_ports=()
+        if [[ -f /etc/nginx/streams-available/minecraft.conf ]]; then
+            mc_ports=($(grep -E "^\s*listen\s+" /etc/nginx/streams-available/minecraft.conf 2>/dev/null | awk '{print $2}' | tr -d ';' || true))
+            info "Found Minecraft ports: ${mc_ports[*]}"
+        fi
+
+        # Remove stream config files
+        rm -f /etc/nginx/streams-enabled/minecraft.conf 2>/dev/null || true
+        rm -f /etc/nginx/streams-available/minecraft.conf 2>/dev/null || true
+        success "Minecraft stream configs removed."
+
+        # Remove stream include from nginx.conf
+        if [[ -f /etc/nginx/nginx.conf ]]; then
+            if grep -q "include /etc/nginx/streams-enabled" /etc/nginx/nginx.conf; then
+                info "Removing stream include from nginx.conf..."
+                sed -i '/include \/etc\/nginx\/streams-enabled/d' /etc/nginx/nginx.conf
+                success "Stream include removed from nginx.conf."
+            fi
+        fi
+
+        # Remove Minecraft UFW rules
+        if [[ ${#mc_ports[@]} -gt 0 ]]; then
+            info "Removing Minecraft UFW rules..."
+            for port in "${mc_ports[@]}"; do
+                ufw delete allow "${port}/tcp" 2>/dev/null || true
+            done
+            success "Minecraft UFW rules removed."
+        fi
+    else
+        info "Skipping Minecraft proxy removal."
+    fi
+
+    # ------------------------------------------------------------------
+    # Step 3: Remove NGINX HTTP configs & NGINX package (reverse of Phase 4)
+    # ------------------------------------------------------------------
+    echo ""
+    separator
+    echo -e "${BOLD}${RED}Step 3/8: Removing NGINX configs and package${NC}"
+    separator
+    echo ""
+
+    if [[ "$FORCE" == true ]] || ask_yes_no "Remove NGINX (configs and package)?" "Y"; then
+        # Stop NGINX
+        if systemctl is-active --quiet nginx 2>/dev/null; then
+            info "Stopping NGINX..."
+            systemctl stop nginx 2>/dev/null || true
+        fi
+        systemctl disable nginx 2>/dev/null || true
+
+        # Remove site configs
+        rm -f /etc/nginx/sites-enabled/amp.conf 2>/dev/null || true
+        rm -f /etc/nginx/sites-enabled/pihole.conf 2>/dev/null || true
+        rm -f /etc/nginx/sites-available/amp.conf 2>/dev/null || true
+        rm -f /etc/nginx/sites-available/pihole.conf 2>/dev/null || true
+        success "NGINX site configs removed."
+
+        # Remove stream directories
+        rm -rf /etc/nginx/streams-available 2>/dev/null || true
+        rm -rf /etc/nginx/streams-enabled 2>/dev/null || true
+
+        # Uninstall NGINX
+        if dpkg -l nginx &>/dev/null 2>&1; then
+            info "Uninstalling NGINX..."
+            apt purge -y nginx nginx-extras nginx-common 2>/dev/null || true
+            apt autoremove -y 2>/dev/null || true
+            success "NGINX uninstalled."
+        else
+            info "NGINX is not installed."
+        fi
+    else
+        info "Skipping NGINX removal."
+    fi
+
+    # ------------------------------------------------------------------
+    # Step 4: Remove Pi-hole (reverse of Phase 3)
+    # ------------------------------------------------------------------
+    echo ""
+    separator
+    echo -e "${BOLD}${RED}Step 4/8: Removing Pi-hole${NC}"
+    separator
+    echo ""
+
+    if [[ "$FORCE" == true ]] || ask_yes_no "Remove Pi-hole?" "Y"; then
+        # Try Pi-hole's built-in uninstaller first
+        if command -v pihole &>/dev/null; then
+            info "Attempting Pi-hole uninstaller..."
+            # Pi-hole uninstaller is interactive, so we use the manual approach
+            info "Stopping Pi-hole FTL service..."
+            systemctl stop pihole-FTL 2>/dev/null || true
+            systemctl disable pihole-FTL 2>/dev/null || true
+        fi
+
+        # Remove Pi-hole packages
+        info "Removing Pi-hole packages..."
+        apt purge -y pihole-FTL pi-hole 2>/dev/null || true
+        apt autoremove -y 2>/dev/null || true
+
+        # Remove Pi-hole directories
+        rm -rf /etc/pihole 2>/dev/null || true
+        rm -rf /var/log/pihole 2>/dev/null || true
+        rm -rf /opt/pihole 2>/dev/null || true
+        rm -f /tmp/basic-install.sh 2>/dev/null || true
+        success "Pi-hole removed."
+
+        # Switch Tailscale DNS back to default (if Tailscale is still installed)
+        if command -v tailscale &>/dev/null && tailscale status &>/dev/null 2>&1; then
+            info "Switching Tailscale DNS back to default (no Pi-hole)..."
+            tailscale up --reset --accept-dns=false --accept-risk=all --ssh 2>&1 || true
+            success "Tailscale DNS switched back to default."
+        fi
+    else
+        info "Skipping Pi-hole removal."
+    fi
+
+    # ------------------------------------------------------------------
+    # Step 5: Remove Tailscale (reverse of Phase 2)
+    # ------------------------------------------------------------------
+    echo ""
+    separator
+    echo -e "${BOLD}${RED}Step 5/8: Removing Tailscale${NC}"
+    separator
+    echo ""
+
+    if [[ "$FORCE" == true ]] || ask_yes_no "Remove Tailscale?" "Y"; then
+        # Disconnect and stop Tailscale
+        if command -v tailscale &>/dev/null; then
+            info "Disconnecting Tailscale..."
+            tailscale down 2>/dev/null || true
+        fi
+
+        # Stop and disable tailscaled
+        systemctl disable --now tailscaled 2>/dev/null || true
+
+        # Remove Tailscale package
+        if dpkg -l tailscale &>/dev/null 2>&1; then
+            info "Uninstalling Tailscale..."
+            apt purge -y tailscale 2>/dev/null || true
+            apt autoremove -y 2>/dev/null || true
+            success "Tailscale uninstalled."
+        else
+            info "Tailscale is not installed."
+        fi
+
+        # Remove Tailscale repo files
+        rm -f /usr/share/keyrings/tailscale-archive-keyring.gpg 2>/dev/null || true
+        rm -f /etc/apt/sources.list.d/tailscale.list 2>/dev/null || true
+        success "Tailscale repository files removed."
+    else
+        info "Skipping Tailscale removal."
+    fi
+
+    # ------------------------------------------------------------------
+    # Step 6: Reset UFW firewall (reverse of Phase 7)
+    # ------------------------------------------------------------------
+    echo ""
+    separator
+    echo -e "${BOLD}${RED}Step 6/8: Resetting UFW firewall${NC}"
+    separator
+    echo ""
+
+    if [[ "$FORCE" == true ]] || ask_yes_no "Reset UFW firewall rules (keep SSH only)?" "Y"; then
+        info "Resetting UFW firewall..."
+        ufw --force reset
+
+        # Re-add SSH rule to avoid lockout
+        ufw default deny incoming
+        ufw default allow outgoing
+        ufw allow 22/tcp comment "SSH"
+        ufw --force enable
+
+        success "UFW firewall reset. Only SSH (port 22) is allowed."
+        info "Review your firewall rules with: ufw status verbose"
+    else
+        info "Skipping UFW reset."
+    fi
+
+    # ------------------------------------------------------------------
+    # Step 7: Remove prerequisite packages (reverse of Phase 1)
+    # ------------------------------------------------------------------
+    echo ""
+    separator
+    echo -e "${BOLD}${RED}Step 7/8: Removing prerequisite packages${NC}"
+    separator
+    echo ""
+
+    if [[ "$FORCE" == true ]] || ask_yes_no "Remove packages installed by this script (curl, wget, etc.)?" "Y"; then
+        info "Removing script-installed packages..."
+        # Note: We use 'remove' not 'purge' for these common utilities
+        # to preserve user data/configs. They're small and commonly needed.
+        apt remove -y \
+            apt-transport-https \
+            software-properties-common \
+            netcat-openbsd \
+            dnsutils \
+            jq \
+            2>/dev/null || true
+        apt autoremove -y 2>/dev/null || true
+        success "Prerequisite packages removed."
+        info "Note: curl, wget, ufw, ca-certificates, gnupg, and lsb-release are kept"
+        info "      as they are commonly needed by other software."
+    else
+        info "Skipping prerequisite package removal."
+    fi
+
+    # ------------------------------------------------------------------
+    # Step 8: Clean up system changes & restore configs
+    # ------------------------------------------------------------------
+    echo ""
+    separator
+    echo -e "${BOLD}${RED}Step 8/8: Cleaning up system changes${NC}"
+    separator
+    echo ""
+
+    # Restore resolv.conf from backup
+    if [[ -f /etc/resolv.conf.bak.vps-setup ]]; then
+        info "Restoring /etc/resolv.conf from backup..."
+        cp /etc/resolv.conf.bak.vps-setup /etc/resolv.conf
+        rm -f /etc/resolv.conf.bak.vps-setup
+        success "/etc/resolv.conf restored."
+    elif [[ -f /etc/resolv.conf.bak.pre-tailscale ]]; then
+        info "Restoring /etc/resolv.conf from Tailscale backup..."
+        cp /etc/resolv.conf.bak.pre-tailscale /etc/resolv.conf
+        rm -f /etc/resolv.conf.bak.pre-tailscale
+        success "/etc/resolv.conf restored."
+    else
+        # Ensure resolv.conf has valid nameservers
+        info "No resolv.conf backup found. Ensuring valid DNS nameservers..."
+        if ! grep -q "nameserver" /etc/resolv.conf 2>/dev/null; then
+            echo "nameserver 1.1.1.1" > /etc/resolv.conf
+            echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+            success "DNS nameservers set to 1.1.1.1 and 8.8.8.8."
+        fi
+    fi
+    rm -f /etc/resolv.conf.bak.pre-tailscale 2>/dev/null || true
+    rm -f /etc/resolv.conf.bak.vps-setup 2>/dev/null || true
+
+    # Ask about hostname restoration
+    if [[ "$FORCE" == true ]] || ask_yes_no "Restore original hostname? (Current: $(hostname))" "N"; then
+        local original_hostname
+        original_hostname=$(cat /etc/vps-setup/original-hostname 2>/dev/null || echo "")
+        if [[ -n "$original_hostname" ]]; then
+            info "Restoring hostname to: $original_hostname"
+            hostnamectl set-hostname "$original_hostname"
+            success "Hostname restored to: $original_hostname"
+        else
+            warn "Original hostname not found in marker file."
+            local new_hostname
+            new_hostname=$(ask_input "Enter hostname to set" "ubuntu")
+            hostnamectl set-hostname "$new_hostname"
+            success "Hostname set to: $new_hostname"
+        fi
+    fi
+
+    # Remove marker directory and log file
+    info "Removing marker files and log..."
+    rm -rf "${MARKER_DIR}" 2>/dev/null || true
+    rm -f "${LOG_FILE}" 2>/dev/null || true
+    success "Marker files and log removed."
+
+    # Clean up apt cache
+    info "Cleaning up apt cache..."
+    apt clean 2>/dev/null || true
+    apt autoremove -y 2>/dev/null || true
+
+    log "=== UNINSTALL COMPLETED ==="
+
+    echo ""
+    separator
+    echo -e "${GREEN}${BOLD}Uninstall complete!${NC}"
+    separator
+    echo ""
+    echo "The following have been removed:"
+    echo "  ✓ SSL certificates & certbot"
+    echo "  ✓ NGINX (configs and package)"
+    echo "  ✓ Minecraft TCP proxy configs"
+    echo "  ✓ Pi-hole DNS sinkhole"
+    echo "  ✓ Tailscale VPN"
+    echo "  ✓ UFW firewall rules (reset to SSH-only)"
+    echo "  ✓ Prerequisite packages"
+    echo "  ✓ Marker files and logs"
+    echo ""
+    echo -e "${YELLOW}Manual steps you may still need to do:${NC}"
+    echo "  1. Remove DNS records pointing to this VPS (A records, SRV records)"
+    echo "  2. Remove this machine from the Tailscale admin console"
+    echo "  3. Review /etc/hosts for any entries added by this script"
+    echo "  4. Remove the Tailscale exit node approval in the admin console"
+    echo "  5. Verify /etc/resolv.conf has valid nameservers"
+    echo ""
+    echo -e "${YELLOW}If you want to re-run setup, use:${NC} sudo bash $0"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
 # Main menu
 # ---------------------------------------------------------------------------
 
@@ -1516,6 +1946,7 @@ show_help() {
     echo "  --force         Re-run completed phases (ignore markers)"
     echo "  --add-mc        Add a new Minecraft instance"
     echo "  --remove-mc     Remove a Minecraft instance"
+    echo "  --uninstall     Remove everything installed by this script"
     echo "  --status        Show current setup status"
     echo "  --skip-phase N  Skip a specific phase (e.g., --skip-phase 3)"
     echo ""
@@ -1534,6 +1965,7 @@ show_help() {
     echo "  sudo bash $0                    # Run full interactive setup"
     echo "  sudo bash $0 --add-mc           # Add a Minecraft instance"
     echo "  sudo bash $0 --force            # Re-run all phases"
+    echo "  sudo bash $0 --uninstall        # Remove everything installed by this script"
     echo "  sudo bash $0 --skip-phase 3     # Skip Pi-hole installation"
 }
 
@@ -1587,6 +2019,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --remove-mc)
             ACTION="remove-mc"
+            shift
+            ;;
+        --uninstall)
+            ACTION="uninstall"
             shift
             ;;
         --status)
@@ -1707,6 +2143,9 @@ main() {
             ;;
         remove-mc)
             remove_minecraft_instance
+            ;;
+        uninstall)
+            uninstall_all
             ;;
     esac
 }
