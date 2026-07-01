@@ -738,6 +738,14 @@ phase4_nginx_http() {
     mkdir -p /etc/nginx/streams-available
     mkdir -p /etc/nginx/streams-enabled
 
+    # Ensure AMP connection details are set (may be empty if Phase 1 was skipped)
+    if [[ -z "$AMP_TS_IP" ]]; then
+        AMP_TS_IP=$(ask_input "Enter AMP server Tailscale IP" "$DEFAULT_AMP_TS_IP")
+    fi
+    if [[ -z "$AMP_TS_PORT" ]]; then
+        AMP_TS_PORT=$(ask_input "Enter AMP server port" "$DEFAULT_AMP_TS_PORT")
+    fi
+
     # Ask for domain names
     AMP_DOMAIN=$(ask_input "Enter domain name for AMP control panel" "amp.example.com")
     PIHOLE_DOMAIN=$(ask_input "Enter domain name for Pi-hole admin panel" "pihole.example.com")
@@ -746,6 +754,13 @@ phase4_nginx_http() {
     VPS_PUBLIC_IP=$(curl -s ifconfig.me 2>/dev/null || curl -s icanhazip.com 2>/dev/null || echo "UNKNOWN")
     info "VPS Public IP: $VPS_PUBLIC_IP"
     info "Make sure your domains ($AMP_DOMAIN, $PIHOLE_DOMAIN) point to this IP."
+
+    # Validate AMP connection details before writing config
+    if [[ -z "$AMP_TS_IP" || -z "$AMP_TS_PORT" ]]; then
+        error "AMP server IP and port are required for NGINX configuration."
+        error "Please re-run Phase 1 or provide these values when prompted."
+        return 1
+    fi
 
     # Create AMP reverse proxy config (HTTP-only initially; SSL added in Phase 6)
     info "Creating NGINX server block for AMP..."
@@ -856,6 +871,14 @@ phase5_nginx_stream() {
 
     # Verify NGINX has stream module
     info "Checking NGINX stream module..."
+
+    # Ensure AMP connection details are available
+    if [[ -z "$AMP_TS_IP" || -z "$AMP_TS_PORT" ]]; then
+        error "AMP server IP and port are required for Minecraft proxy configuration."
+        error "Please re-run Phase 1 or provide these values when prompted."
+        return 1
+    fi
+
     if ! nginx -V 2>&1 | grep -q "stream"; then
         error "NGINX does not have the stream module. Installing nginx-extras..."
         apt install -y nginx-extras
@@ -995,6 +1018,18 @@ phase6_ssl() {
         LE_EMAIL_FLAG="--register-unsafely-without-email"
     else
         LE_EMAIL_FLAG="--email $LE_EMAIL --agree-tos"
+    fi
+
+    # Validate required variables before writing SSL configs
+    if [[ -z "$AMP_TS_IP" || -z "$AMP_TS_PORT" ]]; then
+        error "AMP server IP and port are required for SSL configuration."
+        error "Please re-run Phase 1 or provide these values when prompted."
+        return 1
+    fi
+    if [[ -z "$AMP_DOMAIN" || -z "$PIHOLE_DOMAIN" ]]; then
+        error "Domain names are required for SSL configuration."
+        error "Please re-run Phase 4 or provide these values when prompted."
+        return 1
     fi
 
     # Write full NGINX configs with SSL blocks (replacing HTTP-only configs from Phase 4)
