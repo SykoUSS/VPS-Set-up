@@ -82,8 +82,8 @@ sudo bash vps-setup.sh --help
 | Phase | Description | Interactive? |
 |-------|-------------|-------------|
 | 1 | Prerequisites & System Update | Yes (hostname) |
-| 2 | Tailscale Setup + DNS + Exit Node | Yes (auth, exit node, AMP IP) |
-| 3 | Pi-hole Installation | Yes (password — output to console) |
+| 2 | Pi-hole Installation | Yes (password — output to console) |
+| 3 | Tailscale Setup + DNS + Exit Node | Yes (auth, exit node, AMP IP) |
 | 4 | NGINX HTTP Configuration + SSL | Yes (domain names, email, certbot) |
 | 5 | NGINX Stream (Minecraft TCP) | Yes (instance count, names, ports) |
 | 6 | UFW Firewall Configuration | Yes (confirm reset) |
@@ -94,11 +94,11 @@ sudo bash vps-setup.sh --help
 During setup, you'll be asked:
 
 1. **VPS hostname** — Set the system hostname
-2. **Tailscale authentication** — Browser-based auth flow
-3. **Exit node** — Should this VPS be a Tailscale exit node?
-4. **AMP server Tailscale IP** — e.g., `100.78.246.53`
-5. **AMP server port** — Default: `8080` (HTTP)
-6. **Pi-hole admin password** — Set the web UI password (displayed in console after setup)
+2. **Pi-hole admin password** — Set the web UI password (displayed in console after setup)
+3. **Tailscale authentication** — Browser-based auth flow
+4. **Exit node** — Should this VPS be a Tailscale exit node?
+5. **AMP server Tailscale IP** — e.g., `100.78.246.53`
+6. **AMP server port** — Default: `8080` (HTTP)
 7. **AMP domain name** — e.g., `mcpanel.syko.network`
 8. **Pi-hole domain name** — e.g., `pihole.syko.network`
 9. **Let's Encrypt email** — For SSL certificate notifications
@@ -224,8 +224,8 @@ This reverses all 7 phases in reverse order:
 1. Removes SSL certificates and Certbot
 2. Removes NGINX stream configs (Minecraft proxy)
 3. Removes NGINX HTTP configs and uninstalls NGINX
-4. Removes Pi-hole
-5. Removes Tailscale and exit node configuration (IP forwarding, NAT, UFW forward rules)
+4. Removes Tailscale and exit node configuration (IP forwarding, NAT, UFW forward rules)
+5. Removes Pi-hole
 6. Resets UFW firewall to SSH-only
 7. Removes marker files and restores DNS
 

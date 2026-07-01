@@ -19,8 +19,8 @@
 #
 # Phases:
 #   1. Prerequisites & System Update
-#   2. Tailscale Setup + DNS + Exit Node
-#   3. Pi-hole Installation
+#   2. Pi-hole Installation
+#   3. Tailscale Setup + DNS + Exit Node
 #   4. NGINX HTTP Configuration + SSL (Certbot)
 #   5. NGINX Stream (Minecraft TCP Proxy)
 #   6. UFW Firewall Configuration
@@ -309,8 +309,8 @@ Options:
 
 Phases:
   1. Prerequisites & System Update
-  2. Tailscale Setup + DNS + Exit Node
-  3. Pi-hole Installation
+  2. Pi-hole Installation
+  3. Tailscale Setup + DNS + Exit Node
   4. NGINX HTTP Configuration + SSL (Certbot)
   5. NGINX Stream (Minecraft TCP Proxy)
   6. UFW Firewall Configuration
@@ -319,7 +319,7 @@ Phases:
 Examples:
   sudo bash vps-setup.sh                    # Full interactive setup
   sudo bash vps-setup.sh --force            # Re-run all phases
-  sudo bash vps-setup.sh --skip-phase 3     # Skip Pi-hole installation
+  sudo bash vps-setup.sh --skip-phase 2     # Skip Pi-hole installation
   sudo bash vps-setup.sh --add-mc          # Add a Minecraft instance
   sudo bash vps-setup.sh --uninstall        # Remove everything
 
@@ -376,14 +376,92 @@ phase1_prerequisites() {
 }
 
 # ---------------------------------------------------------------------------
-# Phase 2: Tailscale Setup + DNS + Exit Node
+# Phase 2: Pi-hole Installation
 # ---------------------------------------------------------------------------
+# Pi-hole is installed BEFORE Tailscale so that system DNS is still intact
+# when downloading the Pi-hole installer. Tailscale (Phase 3) will then
+# switch to using Pi-hole for DNS once both are running.
 
-phase2_tailscale() {
-    phase_header "2" "Tailscale Setup + DNS + Exit Node"
+phase2_pihole() {
+    phase_header "2" "Pi-hole Installation"
 
     if is_phase_completed "phase2" && [[ "$FORCE" != true ]]; then
         warn "Phase 2 already completed. Skipping. Use --force to re-run."
+        return 0
+    fi
+
+    # Pre-configure Pi-hole before installation
+    info "Pre-configuring Pi-hole settings..."
+
+    # Ensure DNS resolution works before downloading Pi-hole installer
+    ensure_dns
+
+    # Set up environment variables for unattended install
+    # DNS upstreams: Cloudflare + Google
+    export PIHOLE_INTERFACE=""
+    export PIHOLE_DNS_1="${DNS_UPSTREAM_1}"
+    export PIHOLE_DNS_2="${DNS_UPSTREAM_2}"
+    export QUERY_LOGGING=true
+    export INSTALL_WEB_SERVER=true
+    export INSTALL_WEB_INTERFACE=true
+    export LIGHTTPD_ENABLED=false
+    export DNSMASQ_LISTENING="all"
+
+    # Download Pi-hole installer
+    info "Downloading Pi-hole installer..."
+    curl -fsSL https://install.pi-hole.net -o /tmp/basic-install.sh
+
+    # Run installer unattended
+    info "Running Pi-hole installer (unattended)..."
+    bash /tmp/basic-install.sh --unattended
+
+    # Configure Pi-hole web port to 8443
+    configure_pihole_web_port "$PIHOLE_WEB_PORT"
+
+    # Set Pi-hole admin password
+    info "Setting Pi-hole admin password..."
+    PIHOLE_ADMIN_PASSWORD=$(ask_input "Enter Pi-hole admin password" "" "true")
+
+    # Try v6 password command first, then v5 fallback
+    if pihole setpassword "$PIHOLE_ADMIN_PASSWORD" 2>/dev/null; then
+        success "Pi-hole password set (v6 method)."
+    elif pihole -a -p "$PIHOLE_ADMIN_PASSWORD" 2>/dev/null; then
+        success "Pi-hole password set (v5 method)."
+    else
+        warn "Could not set password via CLI. You may need to set it manually."
+    fi
+
+    # Restart Pi-hole FTL to apply changes
+    info "Restarting Pi-hole FTL..."
+    systemctl restart pihole-FTL 2>/dev/null || pihole restartdns 2>/dev/null || true
+    sleep 2
+
+    success "Pi-hole installation complete."
+    echo ""
+    echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${GREEN}║              PI-HOLE ADMIN CREDENTIALS                       ║${NC}"
+    echo -e "${BOLD}${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${BOLD}${GREEN}║  Web UI:  http://localhost:${PIHOLE_WEB_PORT}/admin              ${NC}"
+    echo -e "${BOLD}${GREEN}║  Password: ${PIHOLE_ADMIN_PASSWORD}                           ${NC}"
+    echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    log "Pi-hole password set and displayed to console."
+
+    phase_completed "phase2"
+}
+
+# ---------------------------------------------------------------------------
+# Phase 3: Tailscale Setup + DNS + Exit Node
+# ---------------------------------------------------------------------------
+# Tailscale is installed AFTER Pi-hole so that when it switches to
+# --accept-dns=true (use Pi-hole for DNS), Pi-hole is already running
+# and DNS resolution continues to work.
+
+phase3_tailscale() {
+    phase_header "3" "Tailscale Setup + DNS + Exit Node"
+
+    if is_phase_completed "phase3" && [[ "$FORCE" != true ]]; then
+        warn "Phase 3 already completed. Skipping. Use --force to re-run."
         return 0
     fi
 
@@ -503,66 +581,8 @@ EOF
         fi
     fi
 
-    phase_completed "phase2"
-}
-
-# ---------------------------------------------------------------------------
-# Phase 3: Pi-hole Installation
-# ---------------------------------------------------------------------------
-
-phase3_pihole() {
-    phase_header "3" "Pi-hole Installation"
-
-    if is_phase_completed "phase3" && [[ "$FORCE" != true ]]; then
-        warn "Phase 3 already completed. Skipping. Use --force to re-run."
-        return 0
-    fi
-
-    # Pre-configure Pi-hole before installation
-    info "Pre-configuring Pi-hole settings..."
-
-    # Set up environment variables for unattended install
-    # DNS upstreams: Cloudflare + Google
-    export PIHOLE_INTERFACE=""
-    export PIHOLE_DNS_1="${DNS_UPSTREAM_1}"
-    export PIHOLE_DNS_2="${DNS_UPSTREAM_2}"
-    export QUERY_LOGGING=true
-    export INSTALL_WEB_SERVER=true
-    export INSTALL_WEB_INTERFACE=true
-    export LIGHTTPD_ENABLED=false
-    export DNSMASQ_LISTENING="all"
-
-    # Download Pi-hole installer
-    info "Downloading Pi-hole installer..."
-    curl -fsSL https://install.pi-hole.net -o /tmp/basic-install.sh
-
-    # Run installer unattended
-    info "Running Pi-hole installer (unattended)..."
-    bash /tmp/basic-install.sh --unattended
-
-    # Configure Pi-hole web port to 8443
-    configure_pihole_web_port "$PIHOLE_WEB_PORT"
-
-    # Set Pi-hole admin password
-    info "Setting Pi-hole admin password..."
-    PIHOLE_ADMIN_PASSWORD=$(ask_input "Enter Pi-hole admin password" "" "true")
-
-    # Try v6 password command first, then v5 fallback
-    if pihole setpassword "$PIHOLE_ADMIN_PASSWORD" 2>/dev/null; then
-        success "Pi-hole password set (v6 method)."
-    elif pihole -a -p "$PIHOLE_ADMIN_PASSWORD" 2>/dev/null; then
-        success "Pi-hole password set (v5 method)."
-    else
-        warn "Could not set password via CLI. You may need to set it manually."
-    fi
-
-    # Restart Pi-hole FTL to apply changes
-    info "Restarting Pi-hole FTL..."
-    systemctl restart pihole-FTL 2>/dev/null || pihole restartdns 2>/dev/null || true
-    sleep 2
-
-    # Switch Tailscale to use Pi-hole for DNS
-    if command -v tailscale &>/dev/null && tailscale status &>/dev/null 2>&1; then
+    # Switch Tailscale to use Pi-hole for DNS (Pi-hole is already running from Phase 2)
+    if command -v pihole &>/dev/null; then
         info "Switching Tailscale to use Pi-hole for DNS..."
         if [[ "$TS_EXIT_NODE" == true ]]; then
             tailscale up --reset --accept-dns=true --advertise-exit-node --accept-risk=all --ssh 2>&1 || true
@@ -570,7 +590,7 @@ phase3_pihole() {
             tailscale up --reset --accept-dns=true --accept-risk=all --ssh 2>&1 || true
         fi
 
-        # Verify DNS still works
+        # Verify DNS still works through Pi-hole
         if curl -fsSL --connect-timeout 10 https://github.com >/dev/null 2>&1; then
             success "Tailscale DNS switched to Pi-hole. DNS resolution working."
         else
@@ -584,18 +604,10 @@ phase3_pihole() {
             fi
             warn "Tailscale DNS override disabled. Enable it later from the admin console."
         fi
+    else
+        warn "Pi-hole not found. Skipping Tailscale DNS switch."
+        warn "You can enable Pi-hole DNS later from the Tailscale admin console."
     fi
-
-    success "Pi-hole installation complete."
-    echo ""
-    echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${GREEN}║              PI-HOLE ADMIN CREDENTIALS                       ║${NC}"
-    echo -e "${BOLD}${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${BOLD}${GREEN}║  Web UI:  http://localhost:${PIHOLE_WEB_PORT}/admin              ${NC}"
-    echo -e "${BOLD}${GREEN}║  Password: ${PIHOLE_ADMIN_PASSWORD}                           ${NC}"
-    echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-    log "Pi-hole password set and displayed to console."
 
     phase_completed "phase3"
 }
@@ -1242,31 +1254,10 @@ uninstall_all() {
         info "Skipping NGINX removal."
     fi
 
-    # Step 4: Remove Pi-hole
+    # Step 4: Remove Tailscale + exit node config
     echo ""
     separator
-    echo -e "${BOLD}${RED}Step 4/7: Removing Pi-hole${NC}"
-    separator
-    if [[ "$FORCE" == true ]] || ask_yes_no "Remove Pi-hole?" "Y"; then
-        systemctl stop pihole-FTL 2>/dev/null || true
-        systemctl disable pihole-FTL 2>/dev/null || true
-        apt purge -y pihole-FTL pi-hole 2>/dev/null || true
-        apt autoremove -y 2>/dev/null || true
-        rm -rf /etc/pihole /var/log/pihole /opt/pihole 2>/dev/null || true
-        rm -f /tmp/basic-install.sh 2>/dev/null || true
-        # Switch Tailscale DNS back
-        if command -v tailscale &>/dev/null && tailscale status &>/dev/null 2>&1; then
-            tailscale up --reset --accept-dns=false --accept-risk=all --ssh 2>&1 || true
-        fi
-        success "Pi-hole removed."
-    else
-        info "Skipping Pi-hole removal."
-    fi
-
-    # Step 5: Remove Tailscale + exit node config
-    echo ""
-    separator
-    echo -e "${BOLD}${RED}Step 5/7: Removing Tailscale & exit node config${NC}"
+    echo -e "${BOLD}${RED}Step 4/7: Removing Tailscale & exit node config${NC}"
     separator
     if [[ "$FORCE" == true ]] || ask_yes_no "Remove Tailscale?" "Y"; then
         if command -v tailscale &>/dev/null; then
@@ -1299,6 +1290,23 @@ uninstall_all() {
         success "Exit node configuration removed."
     else
         info "Skipping Tailscale removal."
+    fi
+
+    # Step 5: Remove Pi-hole
+    echo ""
+    separator
+    echo -e "${BOLD}${RED}Step 5/7: Removing Pi-hole${NC}"
+    separator
+    if [[ "$FORCE" == true ]] || ask_yes_no "Remove Pi-hole?" "Y"; then
+        systemctl stop pihole-FTL 2>/dev/null || true
+        systemctl disable pihole-FTL 2>/dev/null || true
+        apt purge -y pihole-FTL pi-hole 2>/dev/null || true
+        apt autoremove -y 2>/dev/null || true
+        rm -rf /etc/pihole /var/log/pihole /opt/pihole 2>/dev/null || true
+        rm -f /tmp/basic-install.sh 2>/dev/null || true
+        success "Pi-hole removed."
+    else
+        info "Skipping Pi-hole removal."
     fi
 
     # Step 6: Reset UFW firewall
@@ -1359,8 +1367,8 @@ show_status() {
         local phase_name=""
         case $i in
             1) phase_name="Prerequisites & System Update" ;;
-            2) phase_name="Tailscale Setup + DNS + Exit Node" ;;
-            3) phase_name="Pi-hole Installation" ;;
+            2) phase_name="Pi-hole Installation" ;;
+            3) phase_name="Tailscale Setup + DNS + Exit Node" ;;
             4) phase_name="NGINX HTTP Configuration + SSL" ;;
             5) phase_name="NGINX Stream (Minecraft) Configuration" ;;
             6) phase_name="UFW Firewall Configuration" ;;
@@ -1392,8 +1400,8 @@ main() {
 
     # Run all phases in order
     phase1_prerequisites
-    phase2_tailscale
-    phase3_pihole
+    phase2_pihole
+    phase3_tailscale
     phase4_nginx_http
     phase5_nginx_stream
     phase6_ufw
