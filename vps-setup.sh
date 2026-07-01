@@ -358,15 +358,23 @@ phase2_tailscale() {
     sleep 2
     success "tailscaled is running."
 
-    # Authenticate
+    # Backup resolv.conf before Tailscale modifies it
+    # Tailscale can override /etc/resolv.conf to point to 100.100.100.100,
+    # which breaks DNS if tailnet DNS isn't configured yet.
+    info "Backing up /etc/resolv.conf before Tailscale authentication..."
+    cp /etc/resolv.conf /etc/resolv.conf.bak.pre-tailscale 2>/dev/null || true
+
+    # Authenticate with --accept-dns=false to prevent Tailscale from
+    # overriding DNS during setup (Pi-hole will handle DNS later)
     echo ""
     info "You need to authenticate this machine with your Tailscale account."
     info "A URL will be shown below — open it in a browser to log in."
     echo ""
     press_enter
     info "Running 'tailscale up' — look for the login URL below:"
+    info "(Using --accept-dns=false to preserve system DNS during setup)"
     echo ""
-    tailscale up --accept-risk=all 2>&1 || true
+    tailscale up --accept-risk=all --accept-dns=false 2>&1 || true
     echo ""
 
     # Wait for connection
@@ -389,11 +397,34 @@ phase2_tailscale() {
     done
     success "Tailscale is connected."
 
+    # Verify DNS still works after Tailscale connection
+    info "Verifying DNS resolution still works after Tailscale connection..."
+    if ! curl -fsSL --connect-timeout 10 https://github.com >/dev/null 2>&1; then
+        warn "DNS resolution broken after Tailscale connection. Restoring backup..."
+        cp /etc/resolv.conf.bak.pre-tailscale /etc/resolv.conf 2>/dev/null || true
+        # Also try fallback DNS
+        if ! curl -fsSL --connect-timeout 10 https://github.com >/dev/null 2>&1; then
+            if ! grep -q "nameserver 1.1.1.1" /etc/resolv.conf 2>/dev/null; then
+                echo "nameserver 1.1.1.1" >> /etc/resolv.conf
+                echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+            fi
+        fi
+        if curl -fsSL --connect-timeout 10 https://github.com >/dev/null 2>&1; then
+            success "DNS resolution restored."
+        else
+            error "Could not restore DNS resolution. Manual intervention needed."
+            error "Check /etc/resolv.conf and ensure it has valid nameservers."
+            return 1
+        fi
+    else
+        success "DNS resolution is working."
+    fi
+
     # Ask about exit node
     if ask_yes_no "Should this VPS advertise as a Tailscale exit node?" "Y"; then
         TS_EXIT_NODE=true
         info "Configuring as exit node..."
-        tailscale up --advertise-exit-node --accept-risk=all
+        tailscale up --advertise-exit-node --accept-risk=all --accept-dns=false
         success "Exit node advertised. You will need to approve it in the Tailscale admin console."
     fi
 
@@ -516,6 +547,32 @@ EOF
     if [[ -f /etc/pihole/setupVars.conf ]]; then
         if grep -q "^PIHOLE_INTERFACE=" /etc/pihole/setupVars.conf; then
             sed -i 's/^PIHOLE_INTERFACE=.*/PIHOLE_INTERFACE=/' /etc/pihole/setupVars.conf
+        fi
+    fi
+
+    # Now that Pi-hole is running, switch Tailscale to use it for DNS
+    # (During setup we used --accept-dns=false to preserve system DNS)
+    if command -v tailscale &>/dev/null && tailscale status &>/dev/null; then
+        info "Switching Tailscale to use Pi-hole for DNS..."
+        if [[ "$TS_EXIT_NODE" == true ]]; then
+            tailscale up --accept-dns=true --advertise-exit-node --accept-risk=all 2>&1 || true
+        else
+            tailscale up --accept-dns=true --accept-risk=all 2>&1 || true
+        fi
+        # Verify DNS still works after switching to Pi-hole
+        if curl -fsSL --connect-timeout 10 https://github.com >/dev/null 2>&1; then
+            success "Tailscale DNS switched to Pi-hole. DNS resolution working."
+        else
+            warn "DNS resolution failed after switching to Pi-hole DNS."
+            warn "Restoring system DNS and disabling Tailscale DNS override..."
+            # Restore system DNS
+            cp /etc/resolv.conf.bak.pre-tailscale /etc/resolv.conf 2>/dev/null || true
+            if [[ "$TS_EXIT_NODE" == true ]]; then
+                tailscale up --accept-dns=false --advertise-exit-node --accept-risk=all 2>&1 || true
+            else
+                tailscale up --accept-dns=false --accept-risk=all 2>&1 || true
+            fi
+            warn "Tailscale DNS override disabled. You can enable it later from the Tailscale admin console."
         fi
     fi
 
