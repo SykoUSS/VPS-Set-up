@@ -252,7 +252,7 @@ sudo bash vps-setup.sh --uninstall --force
 | `/etc/nginx/sites-available/amp.conf` | AMP reverse proxy config |
 | `/etc/nginx/sites-available/pihole.conf` | Pi-hole reverse proxy config |
 | `/etc/nginx/streams-available/minecraft.conf` | Minecraft TCP stream proxy |
-| `/etc/nginx/nginx.conf` | Stream include directive |
+| `/etc/nginx/nginx.conf` | Stream block directive (`stream { include ... }`) |
 | `/etc/nginx/sites-enabled/` | Symlinks to HTTP configs |
 | `/etc/nginx/streams-enabled/` | Symlinks to stream configs |
 | `/etc/letsencrypt/` | SSL certificates (managed by certbot) |

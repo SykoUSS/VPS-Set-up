@@ -951,14 +951,16 @@ phase5_nginx_stream() {
     # Enable stream config
     ln -sf /etc/nginx/streams-available/minecraft.conf /etc/nginx/streams-enabled/minecraft.conf
 
-    # Add stream include to nginx.conf if not already present
+    # Add stream block to nginx.conf if not already present
     if ! grep -q "include /etc/nginx/streams-enabled" /etc/nginx/nginx.conf; then
-        info "Adding stream include to nginx.conf..."
-        # Insert before the last closing brace or at the end of the main context
-        # We need to add it in the main context, not inside http block
+        info "Adding stream block to nginx.conf..."
+        # Insert a stream { } block before the http { } block
+        # The stream block must be in the main context, not inside http
         sed -i '/^http {/i \
 # Stream module configuration for TCP proxying\
-include /etc/nginx/streams-enabled/*.conf;\
+stream {\
+    include /etc/nginx/streams-enabled/*.conf;\
+}\
 
 ' /etc/nginx/nginx.conf
     fi
@@ -1723,10 +1725,15 @@ uninstall_all() {
 
         # Remove stream include from nginx.conf
         if [[ -f /etc/nginx/nginx.conf ]]; then
-            if grep -q "include /etc/nginx/streams-enabled" /etc/nginx/nginx.conf; then
-                info "Removing stream include from nginx.conf..."
-                sed -i '/include \/etc\/nginx\/streams-enabled/d' /etc/nginx/nginx.conf
-                success "Stream include removed from nginx.conf."
+            if grep -q "streams-enabled" /etc/nginx/nginx.conf; then
+                info "Removing stream block from nginx.conf..."
+                # Remove the entire stream { ... } block (may be multi-line or single-line)
+                sed -i '/^stream {/,/^}/d' /etc/nginx/nginx.conf
+                # Also remove the comment line above it
+                sed -i '/# Stream module configuration for TCP proxying/d' /etc/nginx/nginx.conf
+                # Clean up any blank lines left behind
+                sed -i '/^$/N;/^\n$/d' /etc/nginx/nginx.conf
+                success "Stream block removed from nginx.conf."
             fi
         fi
 
