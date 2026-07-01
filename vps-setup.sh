@@ -953,8 +953,12 @@ phase5_nginx_stream() {
     ln -sf /etc/nginx/streams-available/minecraft.conf /etc/nginx/streams-enabled/minecraft.conf
 
     # Add stream block to nginx.conf if not already present
-    if ! grep -q "include /etc/nginx/streams-enabled" /etc/nginx/nginx.conf; then
+    # Check for the stream { } block (not just the include line, which may be bare from a previous run)
+    if ! grep -q "^stream {" /etc/nginx/nginx.conf; then
         info "Adding stream block to nginx.conf..."
+        # Remove any old bare include line (from a previous run that didn't wrap it in stream {})
+        sed -i '/include \/etc\/nginx\/streams-enabled/d' /etc/nginx/nginx.conf
+        sed -i '/# Stream module configuration for TCP proxying/d' /etc/nginx/nginx.conf
         # Insert a stream { } block before the http { } block
         # The stream block must be in the main context, not inside http
         sed -i '/^http {/i \
