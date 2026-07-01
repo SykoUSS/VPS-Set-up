@@ -7,13 +7,13 @@ Interactive Bash script to configure an Ubuntu VPS with **NGINX** (reverse proxy
 ```
 Internet ──► NGINX (VPS)
                 ├── HTTP (ports 80/443):
-                │   ├── amp.example.com  ──► 100.78.246.53:443 (AMP web panel via Tailscale)
+                │   ├── amp.example.com  ──► <AMP_TAILSCALE_IP>:443 (AMP web panel via Tailscale)
                 │   └── pihole.example.com ──► localhost:8443 (Pi-hole web UI)
                 │
                 └── Stream/TCP (dynamic ports):
-                    ├── :25565 ──► 100.78.246.53:25565 (MC instance 1)
-                    ├── :25566 ──► 100.78.246.53:25566 (MC instance 2)
-                    └── :25567 ──► 100.78.246.53:25567 (MC instance 3)
+                    ├── :25565 ──► <AMP_TAILSCALE_IP>:25565 (MC instance 1)
+                    ├── :25566 ──► <AMP_TAILSCALE_IP>:25566 (MC instance 2)
+                    └── :25567 ──► <AMP_TAILSCALE_IP>:25567 (MC instance 3)
                     ... (as many as needed)
 
 DNS SRV Records:
@@ -22,7 +22,7 @@ DNS SRV Records:
   _minecraft._tcp.skyblock.example.com → play.example.com:25567
 
 Tailscale Network:
-  VPS (exit node) ◄──► 100.78.246.53 (AMP machine)
+  VPS (exit node) ◄──► <AMP_TAILSCALE_IP> (AMP machine)
   Pi-hole DNS: 100.x.x.x (VPS Tailscale IP) configured as tailnet DNS
 ```
 
@@ -31,8 +31,12 @@ Tailscale Network:
 - **Ubuntu VPS** (20.04 LTS or newer) with root/sudo access
 - **Domain names** pointing to your VPS public IP (for AMP and Pi-hole)
 - **Tailscale account** (free tier works)
-- **AMP server** already running on a Tailscale-connected machine at `100.78.246.53:443`
+- **AMP server** already running on a Tailscale-connected machine (IP prompted during setup)
 - **Ports open** on VPS firewall: 22 (SSH), 80/443 (HTTP/HTTPS), 25565+ (Minecraft)
+
+## Security Note
+
+This script is safe for public repositories — **no secrets, tokens, or private IPs are hardcoded**. All sensitive values (AMP server IP, Pi-hole password, domain names, email) are collected interactively at runtime. The default AMP IP shown in prompts is a placeholder (`123.45.67.89`) — replace it with your own when running the script.
 
 ## Quick Start
 

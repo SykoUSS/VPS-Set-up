@@ -11,11 +11,11 @@
 # Architecture:
 #   Internet ──► NGINX (VPS)
 #                   ├── HTTP (80/443):
-#                   │   ├── amp.example.com  ──► 100.78.246.53:443 (AMP via Tailscale)
+#                   │   ├── amp.example.com  ──► <AMP_TAILSCALE_IP>:443 (AMP via Tailscale)
 #                   │   └── pihole.example.com ──► localhost:8443 (Pi-hole web UI)
 #                   └── Stream/TCP (dynamic ports):
-#                       ├── :25565 ──► 100.78.246.53:25565 (MC instance 1)
-#                       ├── :25566 ──► 100.78.246.53:25566 (MC instance 2)
+#                       ├── :25565 ──► <AMP_TAILSCALE_IP>:25565 (MC instance 1)
+#                       ├── :25566 ──► <AMP_TAILSCALE_IP>:25566 (MC instance 2)
 #                       └── ...
 #
 # Usage:
@@ -33,8 +33,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 readonly SCRIPT_VERSION="1.0.0"
 readonly MARKER_DIR="/etc/vps-setup"
-readonly AMP_TS_IP="100.78.246.53"
-readonly AMP_TS_PORT="443"
+readonly DEFAULT_AMP_TS_IP="123.45.67.89"  # Default — will be prompted interactively
+readonly DEFAULT_AMP_TS_PORT="443"
 readonly PIHOLE_WEB_PORT="8443"
 readonly LOG_FILE="/var/log/vps-setup.log"
 
@@ -60,6 +60,8 @@ LE_EMAIL=""
 MC_INSTANCES=()        # Array of "name:amp_port:vps_port"
 TS_IP=""               # VPS Tailscale IP (discovered after tailscale up)
 VPS_PUBLIC_IP=""       # VPS public IP (discovered via API)
+AMP_TS_IP=""           # AMP server Tailscale IP (prompted interactively)
+AMP_TS_PORT=""         # AMP server port (prompted interactively)
 
 # ---------------------------------------------------------------------------
 # Utility functions
@@ -247,6 +249,10 @@ phase1_prerequisites() {
     else
         info "Hostname is already $VPS_HOSTNAME"
     fi
+
+    # Ask for AMP server details
+    AMP_TS_IP=$(ask_input "Enter AMP server Tailscale IP" "$DEFAULT_AMP_TS_IP")
+    AMP_TS_PORT=$(ask_input "Enter AMP server port" "$DEFAULT_AMP_TS_PORT")
 
     # Update system
     info "Updating system packages... (this may take a few minutes)"
@@ -1210,6 +1216,14 @@ add_minecraft_instance() {
     if [[ ! -d /etc/nginx/streams-available ]]; then
         error "NGINX stream directories not found. Run the full setup first."
         return 1
+    fi
+
+    # Prompt for AMP IP if not already set
+    if [[ -z "$AMP_TS_IP" ]]; then
+        AMP_TS_IP=$(ask_input "Enter AMP server Tailscale IP" "$DEFAULT_AMP_TS_IP")
+    fi
+    if [[ -z "$AMP_TS_PORT" ]]; then
+        AMP_TS_PORT=$(ask_input "Enter AMP server port" "$DEFAULT_AMP_TS_PORT")
     fi
 
     local name amp_port vps_port
